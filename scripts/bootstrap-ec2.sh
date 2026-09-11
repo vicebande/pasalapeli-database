@@ -9,6 +9,8 @@
 #   AZURE_AUTH_ENABLED, AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_APP_ID_URI
 #   AZURE_AD_ISSUER_URI, AZURE_AD_JWK_SET_URI
 #   AWS_S3_ENABLED, AWS_S3_BUCKET, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   SPRING_DATASOURCE_URL  (URL de la BDD externa EC2-BDD) opcional
+#   CORS_ALLOWED_ORIGINS   (origen permitido del frontend, ej. https://peli.midominio.cl)
 #   DOMAIN            (dominio publico, ej. peli.midominio.cl) opcional
 #   CERTBOT_EMAIL     (email para Let's Encrypt) opcional
 #   FORCE_ENV         (true para sobrescribir .env existente) opcional
@@ -19,6 +21,8 @@ APP_DIR="/opt/pasalapeli"
 REPOS=(pasalapeli-database pasalapeli-frontend pasalapeli-bff-service pasalapeli-movie-service pasalapeli-ticket-service)
 DOMAIN="${DOMAIN:-}"
 CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
+SPRING_DATASOURCE_URL="${SPRING_DATASOURCE_URL:-}"
+CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-*}"
 REPO_OWNER="${REPO_OWNER:-}"
 
 log() { echo "==> $*"; }
@@ -71,6 +75,7 @@ MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-root}
 MYSQL_DATABASE=pasalapeli_db
 SPRING_DATASOURCE_USERNAME=${SPRING_DATASOURCE_USERNAME:-root}
 SPRING_DATASOURCE_PASSWORD=${SPRING_DATASOURCE_PASSWORD:-root}
+SPRING_DATASOURCE_URL=${SPRING_DATASOURCE_URL:-jdbc:mysql://mysql:3306/pasalapeli_db?createDatabaseIfNotExist=false&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
 
 AZURE_AUTH_ENABLED=${AZURE_AUTH_ENABLED:-false}
 AZURE_CLIENT_ID=${AZURE_CLIENT_ID:-00000000-0000-0000-0000-000000000000}
@@ -113,8 +118,8 @@ else
       -subj "/CN=localhost"
     chmod 600 "$APP_DIR/certs/"*
   fi
-  log "CORS_ALLOWED_ORIGINS queda en * (modo pruebas)"
-  sed -i 's|^CORS_ALLOWED_ORIGINS=.*|CORS_ALLOWED_ORIGINS=*|' "$ENV_FILE"
+  log "CORS_ALLOWED_ORIGINS queda configurado en EC2-APPS"
+  sed -i "s|^CORS_ALLOWED_ORIGINS=.*|CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS}|" "$ENV_FILE"
   sed -i 's|^APP_BASE_URL=.*|APP_BASE_URL=https://localhost|' "$ENV_FILE"
 fi
 
@@ -124,5 +129,27 @@ docker compose up -d --build
 
 log "Estado de los contenedores:"
 docker compose ps
+
+log "Esperando healthcheck de los servicios (hasta 180s)"
+SERVICES=(pasalapeli-bff pasalapeli-movie pasalapeli-ticket)
+ALL_HEALTHY=0
+for i in $(seq 1 36); do
+  ALL_HEALTHY=1
+  for c in "${SERVICES[@]}"; do
+    STATUS=$(docker inspect --format '{{.State.Health.Status}}' "$c" 2>/dev/null || echo "starting")
+    [ "$STATUS" = "healthy" ] || ALL_HEALTHY=0
+  done
+  if [ "$ALL_HEALTHY" = "1" ]; then
+    log "Todos los servicios healthy (iteracion $i)."
+    break
+  fi
+  sleep 5
+done
+if [ "$ALL_HEALTHY" != "1" ]; then
+  log "ERROR: los servicios no quedaron healthy tras 180s."
+  log "Revise la conectividad a MySQL (<IP_BDD>:3306) y el secret SPRING_DATASOURCE_URL."
+  docker compose logs --tail=50 bff-service movie-service ticket-service || true
+  exit 1
+fi
 
 log "Bootstrap finalizado."

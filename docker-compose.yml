@@ -1,47 +1,20 @@
 name: pasalapeli
 
 services:
-  mysql:
-    image: mysql:8.0
-    container_name: pasalapeli-mysql
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
-      MYSQL_DATABASE: pasalapeli_db
-      TZ: America/Santiago
-    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
-    ports:
-      # Solo accesible desde la propia instancia (debugging via SSH tunnel)
-      - "127.0.0.1:3306:3306"
-    volumes:
-      - mysql-data:/var/lib/mysql
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    networks:
-      - pasalapeli-net
-
   movie-service:
     container_name: pasalapeli-movie
     restart: unless-stopped
     build:
       context: ../pasalapeli-movie-service
     environment:
-      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:-jdbc:mysql://mysql:3306/pasalapeli_db?createDatabaseIfNotExist=false&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
-      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-root}
-      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-root}
+      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:-jdbc:mysql://<IP_BDD>:3306/pasalapeli_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-pasalapeli}
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-pasalapeli123}
       AWS_S3_ENABLED: ${AWS_S3_ENABLED:-false}
       AWS_S3_BUCKET: ${AWS_S3_BUCKET:-pasalapeli-portadas}
       AWS_REGION: ${AWS_REGION:-us-east-1}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
-    depends_on:
-      mysql:
-        condition: service_healthy
     volumes:
       - movie-uploads:/app/uploads
     networks:
@@ -53,13 +26,11 @@ services:
     build:
       context: ../pasalapeli-ticket-service
     environment:
-      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:-jdbc:mysql://mysql:3306/pasalapeli_db?createDatabaseIfNotExist=false&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
-      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-root}
-      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-root}
+      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:-jdbc:mysql://<IP_BDD>:3306/pasalapeli_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-pasalapeli}
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-pasalapeli123}
       MOVIE_SERVICE_URL: http://movie-service:8082
     depends_on:
-      mysql:
-        condition: service_healthy
       movie-service:
         condition: service_started
     networks:
@@ -90,29 +61,7 @@ services:
     networks:
       - pasalapeli-net
 
-  frontend:
-    container_name: pasalapeli-frontend
-    restart: unless-stopped
-    build:
-      context: ../pasalapeli-frontend
-      args:
-        AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-00000000-0000-0000-0000-000000000000}
-        AZURE_TENANT_ID: ${AZURE_TENANT_ID:-common}
-        APP_BASE_URL: ${APP_BASE_URL:-https://localhost}
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      # Certificados Let's Encrypt generados por scripts/ (fullchain.pem + privkey.pem)
-      - ./certs:/etc/nginx/certs:ro
-    depends_on:
-      bff-service:
-        condition: service_started
-    networks:
-      - pasalapeli-net
-
 volumes:
-  mysql-data:
   movie-uploads:
 
 networks:

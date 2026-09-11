@@ -28,8 +28,16 @@ fi
 COMPOSE_DIR="$APP_DIR/pasalapeli-database"
 CERT_DIR="$APP_DIR/certs"
 
+# Topologia 3 EC2: el frontend vive en docker-compose.web.yml (EC2-WEB).
+# Fallback a docker-compose.yml (frontend aun en el compose) para single-EC2.
+if [ -f "$COMPOSE_DIR/docker-compose.web.yml" ]; then
+  COMPOSE_FILE="docker-compose.web.yml"
+else
+  COMPOSE_FILE="docker-compose.yml"
+fi
+
 echo "==> Deteniendo frontend para liberar puertos 80/443"
-docker compose -f "$COMPOSE_DIR/docker-compose.yml" stop frontend
+docker compose -f "$COMPOSE_DIR/$COMPOSE_FILE" stop frontend
 
 set +e
 echo "==> Ejecutando certbot renew (standalone)"
@@ -47,6 +55,6 @@ sudo cp "/etc/letsencrypt/live/$DOMAIN/privkey.pem"  "$CERT_DIR/privkey.pem"
 sudo chown "$(whoami)" "$CERT_DIR/"*
 
 echo "==> Re-iniciando frontend"
-docker compose -f "$COMPOSE_DIR/docker-compose.yml" up -d frontend
+docker compose -f "$COMPOSE_DIR/$COMPOSE_FILE" up -d frontend
 
 echo "==> Renovacion finalizada."
