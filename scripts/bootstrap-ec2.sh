@@ -28,6 +28,10 @@ export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -y
 sudo apt-get install -y ca-certificates curl git openssl nginx certbot python3-certbot-nginx cron
 
+# El nginx del SO ocuparia los puertos 80/443; el frontend corre en contenedor.
+sudo systemctl stop nginx 2>/dev/null || true
+sudo systemctl disable nginx 2>/dev/null || true
+
 if ! command -v docker >/dev/null 2>&1; then
   log "Instalando Docker Engine"
   curl -fsSL https://get.docker.com | sudo sh
@@ -106,10 +110,12 @@ else
     openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
       -keyout "$APP_DIR/certs/privkey.pem" \
       -out "$APP_DIR/certs/fullchain.pem" \
-      -subj "/CN=$DOMAIN"
+      -subj "/CN=localhost"
     chmod 600 "$APP_DIR/certs/"*
   fi
   log "CORS_ALLOWED_ORIGINS queda en * (modo pruebas)"
+  sed -i 's|^CORS_ALLOWED_ORIGINS=.*|CORS_ALLOWED_ORIGINS=*|' "$ENV_FILE"
+  sed -i 's|^APP_BASE_URL=.*|APP_BASE_URL=https://localhost|' "$ENV_FILE"
 fi
 
 log "Levantando el stack completo"
