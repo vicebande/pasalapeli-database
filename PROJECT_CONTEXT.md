@@ -426,9 +426,7 @@ Variables opcionales: `AWS_S3_ENABLED`, `AWS_S3_BUCKET`, `AWS_REGION`.
 
 ### 9.9 Notas de seguridad y buenas prácticas detectadas
 
-- `ddl-auto: update` se mantiene (proyecto académico); para producción madura debería pasar a `validate` + migraciones (Flyway/Liquibase).
 - CORS restrictivo por defecto en producción via `CORS_ALLOWED_ORIGINS`.
-- Los contenedores Java corren como root (aceptable para EP1; en producción usar `USER` no-root).
 - El frontend usa `http://` solo en dev; producción es HTTPS.
 
 ### 9.10 Decisión de despliegue: TOPOLOGÍA DE 3 EC2 (11/09/2026)
