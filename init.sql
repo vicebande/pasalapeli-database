@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS `Ticket` (
   `estado` ENUM('PENDIENTE', 'PAGADO', 'CANCELADO') NOT NULL DEFAULT 'PENDIENTE',
   `usuario_id` BIGINT NOT NULL,
   `funcion_id` BIGINT NOT NULL,
+  `cantidad` INT NOT NULL DEFAULT 1,
   PRIMARY KEY (`id`),
   INDEX `idx_ticket_usuario` (`usuario_id`),
   INDEX `idx_ticket_funcion` (`funcion_id`),
@@ -128,10 +129,10 @@ INSERT INTO `Funcion` (`id`, `fecha`, `hora`, `sala`, `entradas_disponibles`, `p
 (8, DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY), '18:30:00', 'Sala 4 - 2D', 50, 4200.00, 4),
 (9, DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY), '20:00:00', 'Sala 1 - IMAX', 55, 5500.00, 5);
 
-INSERT INTO `Ticket` (`id`, `fecha_compra`, `codigo`, `estado`, `usuario_id`, `funcion_id`) VALUES
-(1, DATE_SUB(NOW(), INTERVAL 2 HOUR), 'PLP-2026-0001', 'PAGADO', 2, 1),
-(2, DATE_SUB(NOW(), INTERVAL 1 HOUR), 'PLP-2026-0002', 'PAGADO', 3, 3);
+INSERT INTO `Ticket` (`id`, `fecha_compra`, `codigo`, `estado`, `usuario_id`, `funcion_id`, `cantidad`) VALUES
+(1, DATE_SUB(NOW(), INTERVAL 2 HOUR), 'PLP-2026-0001', 'PAGADO', 2, 1, 1),
+(2, DATE_SUB(NOW(), INTERVAL 1 HOUR), 'PLP-2026-0002', 'PAGADO', 3, 3, 2);
 
 INSERT INTO `Pago` (`id`, `monto`, `metodo`, `estado`, `fecha_pago`, `ticket_id`) VALUES
 (1, 5500.00, 'WEBPAY', 'APROBADO', DATE_SUB(NOW(), INTERVAL 2 HOUR), 1),
-(2, 4800.00, 'TARJETA_CREDITO', 'APROBADO', DATE_SUB(NOW(), INTERVAL 1 HOUR), 2);
+(2, 9600.00, 'TARJETA_CREDITO', 'APROBADO', DATE_SUB(NOW(), INTERVAL 1 HOUR), 2);

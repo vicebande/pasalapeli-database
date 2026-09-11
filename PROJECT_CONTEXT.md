@@ -90,6 +90,7 @@ El modelo cumple con `Diagramas/Diagrama BDD.png`:
    - `estado`: ENUM('PENDIENTE', 'PAGADO', 'CANCELADO')
    - `usuario_id`: BIGINT FK -> `Usuario(id)`
    - `funcion_id`: BIGINT FK -> `Funcion(id)`
+   - `cantidad`: INT (entradas por ticket, DEFAULT 1)
 
 5. **`Pago`**:
    - `id`: BIGINT PK AUTO_INCREMENT
