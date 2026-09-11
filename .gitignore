@@ -1,0 +1,14 @@
+# No commitear valores reales
+.env
+certs/
+
+# IDE / OS
+.idea
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# No commitear claves SSH
+*.pem
+*.key

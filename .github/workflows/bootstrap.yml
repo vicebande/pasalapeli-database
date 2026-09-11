@@ -1,0 +1,44 @@
+name: Bootstrap EC2 - Pasa La Peli
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  bootstrap:
+    name: Setup EC2 y despliegue completo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ejecutar bootstrap en el EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          command_timeout: 60m
+          envs: REPO_OWNER,MYSQL_ROOT_PASSWORD,SPRING_DATASOURCE_USERNAME,SPRING_DATASOURCE_PASSWORD,AZURE_AUTH_ENABLED,AZURE_CLIENT_ID,AZURE_TENANT_ID,AZURE_APP_ID_URI,AZURE_AD_ISSUER_URI,AZURE_AD_JWK_SET_URI,AWS_S3_ENABLED,AWS_S3_BUCKET,AWS_REGION,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,DOMAIN,CERTBOT_EMAIL,APP_BASE_URL,CORS_ALLOWED_ORIGINS
+          script: |
+            set -euo pipefail
+            REPO_OWNER="${{ github.repository_owner }}"
+            CERTBOT_EMAIL="${{ vars.CERTBOT_EMAIL }}"
+            DOMAIN="${{ vars.EC2_DOMAIN }}"
+            APP_BASE_URL="https://$DOMAIN"
+            CORS_ALLOWED_ORIGINS="https://$DOMAIN"
+
+            if [ -d /opt/pasalapeli/pasalapeli-database/.git ]; then
+              cd /opt/pasalapeli/pasalapeli-database
+              git pull --ff-only origin main
+            else
+              sudo mkdir -p /opt/pasalapeli
+              sudo chown "$(whoami)" /opt/pasalapeli
+              git clone "https://github.com/$REPO_OWNER/pasalapeli-database.git" /opt/pasalapeli/pasalapeli-database
+              cd /opt/pasalapeli/pasalapeli-database
+            fi
+
+            # Carga el .env si existe para no perder configuracion previa
+            set +u
+            [ -f /opt/pasalapeli/pasalapeli-database/.env ] && export $(grep -v '^#' /opt/pasalapeli/pasalapeli-database/.env | xargs)
+            set -u
+
+            bash scripts/bootstrap-ec2.sh
