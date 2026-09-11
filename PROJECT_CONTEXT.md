@@ -519,3 +519,27 @@ Se revisaron todos los archivos del flujo (compose, workflows, Dockerfiles, ngin
 4. Se marcaron **Factory Method / Circuit Breaker / Retry como NO implementados** (propuesta) junto con sus alternativas reales (lock pesimista, timeouts, fallbacks locales) — secciones 5 (Flujo 5) y 8 (R1-R2).
 5. Se crearon **9 `.txt` UML corregidos** en `Diagramas/` (01..09) como fuente de verdad; los 7 PNG heredados quedan obsoletos. El txt original `diagramas_uml_tickets_cine.txt` ya no debe usarse como fuente.
 6. Se sincronizaron las **5 copias** en `Github/{frontend,database,bff-service,movie-service,ticket-service}/PROJECT_CONTEXT.md` con el maestro (antes contenían la versión monorepo/1-EC2 desactualizada).
+
+## 12. REVISIÓN FINAL DE FUNCIONAMIENTO LÓGICO Y FIXES APLICADOS (11/09/2026)
+
+**Contexto:** Revisión integral del código de los 5 repos (4 agentes en paralelo: ticket, movie, bff y frontend) + verificación de builds (`mvn compile` × 3 y `ng build`) y validación PlantUML de los 9 diagramas. Se corrigieron todos los hallazgos reales y se pusheó a `main`.
+
+**Hallazgos y fixes por repo:**
+
+| Repo | Hallazgo | Fix aplicado | Commit |
+| :--- | :--- | :--- | :--- |
+| ticket-service | **CRÍTICO**: `cantidad` nunca se persistía; todas las lecturas devolvían `1` | Campo `cantidad` en `Ticket.java`; se asigna en `procesarCompra`; `mapToDTO` lee `t.getCantidad()` | `4d46eac` |
+| ticket-service | `consultarDisponibilidad` podía retornar body null | Guard que lanza error claro | `4d46eac` |
+| ticket-service | Faltaban handlers 400/405 (path convoy parse, body ilegible, query faltante, método no soportado) | Nuevos handlers en `GlobalExceptionHandler` | `4d46eac` |
+| database | Esquema sin `cantidad` en `Ticket`; seeds incoherentes | Columna `cantidad INT NOT NULL DEFAULT 1` + seed 2 a `cantidad=2` con pago 9600 | `420df69` |
+| bff-service | **ALTO**: error de compra se enviaba como JSON-String (Content-Type inconsistente, rompía el manejo de error del frontend) | `TicketClient.comprarTicket` parsea el body a `Map` con Jackson | `ffd414e` |
+| bff-service | No existía `GET /api/tickets` (raíz) y la identidad se resolvía solo dentro de `/me` | Nuevo `UsuarioContext` (find-or-create por correo + fallback demo) y endpoint raíz para listar mis tickets del autenticado | `ffd414e` |
+| movie-service | **ALTO**: N+1 en `listarPeliculas` (acceso lazy a funciones por fila) | `findAllWithFunciones()` + nuevo `buscarPorTituloConFunciones()` con `LEFT JOIN FETCH` | `4219d56` |
+| movie-service | Faltaban handlers 400/405 | Añadidos a `GlobalExceptionHandler` | `4219d56` |
+| frontend | no mostraba la cantidad de entradas compradas | Fila "N entrada(s)" en `mis-tickets` usando `t.cantidad` | `3a90384` |
+
+**Aclaración de diseño (importante para agentes futuros):** el pago es **100 % simulado** (frontend avisa "pago simulado"; `Pago` se crea con `estado=APROBADO` directo y `monto = cantidad × precio`; no existe gateway externo). Por ello **NO corresponde** implementar saga/compensación ni orquestar pagos reales. La consistencia stock↔ticket se apoya en disponibilidad en tiempo real + lock pesimista al descontar (`findByIdForUpdate`), suficiente para el alcance académico.
+
+**Docs sincronizados:** `PROJECT_CONTEXT.md` maestro + 5 copias idénticas (hash `EDAC3DA3AFE1A09ABC83271EB339E62C`); `Diagramas/05_base_datos_UML.txt` actualizado con `cantidad` en `Ticket` (validado con plantuml -checkonly, exit 0). Se eliminaron las notas de "producción madura" no esenciales del §9.9.
+
+**Estado final:** repos `main` en sync con `origin/main` (0 ahead / 0 behind), working trees limpios. Commits pusheados: ticket `9d01359`, database `a23c4d5`, bff `89c7b4f`, movie `a000473`, frontend `5584952` (world) + fixes de código listados arriba.
