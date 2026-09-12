@@ -54,7 +54,7 @@ docker compose version
 
 log "Preparando directorio de despliegue"
 sudo mkdir -p "$APP_DIR" "$APP_DIR/certs"
-sudo chown "$(whoami)" "$APP_DIR"
+sudo chown -R "$(whoami)" "$APP_DIR"
 
 log "Clonando/actualizando repositorios"
 if [ -n "$REPO_OWNER" ]; then
