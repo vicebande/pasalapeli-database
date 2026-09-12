@@ -51,7 +51,7 @@ jobs:
               CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-*}"
             fi
             # Exportar para que bootstrap-ec2.sh (subproceso) las reciba
-            export APP_BASE_URL CORS_ALLOWED_ORIGINS SPRING_DATASOURCE_URL
+            export APP_BASE_URL CERTBOT_EMAIL CORS_ALLOWED_ORIGINS DOMAIN REPO_OWNER SPRING_DATASOURCE_URL
 
             if [ -d /opt/pasalapeli/pasalapeli-database/.git ]; then
               cd /opt/pasalapeli/pasalapeli-database
