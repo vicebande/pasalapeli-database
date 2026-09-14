@@ -70,6 +70,8 @@ fi
 log "Generando .env (solo si no existe o FORCE_ENV=true)"
 ENV_FILE="$APP_DIR/pasalapeli-database/.env"
 if [ ! -s "$ENV_FILE" ] || [ "${FORCE_ENV:-false}" = "true" ]; then
+  # Backup del .env previo antes de regenerar (facil de revertir si algo falla)
+  [ -s "$ENV_FILE" ] && cp "$ENV_FILE" "$ENV_FILE.bak"
   cat > "$ENV_FILE" <<EOF
 MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-root}
 MYSQL_DATABASE=pasalapeli_db

@@ -63,9 +63,20 @@ jobs:
               cd /opt/pasalapeli/pasalapeli-database
             fi
 
-            # Carga el .env si existe para no perder configuracion previa
+            # Carga el .env existente SOLO para claves que NO vengan ya
+            # definidas por los secrets/variables del workflow. Asi los nuevos
+            # valores de AZURE_* no son pisados por los viejos del servidor.
             set +u
-            [ -f /opt/pasalapeli/pasalapeli-database/.env ] && export $(grep -v '^#' /opt/pasalapeli/pasalapeli-database/.env | xargs)
+            if [ -f /opt/pasalapeli/pasalapeli-database/.env ]; then
+              while IFS='=' read -r _key _val; do
+                case "$_key" in ''|*\#*) continue;; esac
+                if [ -z "${!_key:-}" ]; then
+                  export "$_key=$_val"
+                fi
+              done < /opt/pasalapeli/pasalapeli-database/.env
+            fi
             set -u
+            # Aplicar secrets de Azure: forzar la regeneracion completa del .env
+            export FORCE_ENV=true
 
             bash scripts/bootstrap-ec2.sh
