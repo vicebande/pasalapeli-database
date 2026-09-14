@@ -6,15 +6,12 @@ services:
     restart: unless-stopped
     build:
       context: ../pasalapeli-movie-service
+    ports:
+      - "8082:8082"
     environment:
       SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:-jdbc:mysql://<IP_BDD>:3306/pasalapeli_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
       SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-pasalapeli}
       SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-pasalapeli123}
-      AWS_S3_ENABLED: ${AWS_S3_ENABLED:-false}
-      AWS_S3_BUCKET: ${AWS_S3_BUCKET:-pasalapeli-portadas}
-      AWS_REGION: ${AWS_REGION:-us-east-1}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
     volumes:
       - movie-uploads:/app/uploads
     networks:
