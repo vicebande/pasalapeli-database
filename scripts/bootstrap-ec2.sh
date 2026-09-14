@@ -125,6 +125,9 @@ else
   sed -i 's|^APP_BASE_URL=.*|APP_BASE_URL=https://localhost|' "$ENV_FILE"
 fi
 
+log "Limpiando contenedores previos/huerfanos (evita conflictos de nombre con stacks antiguos)"
+docker ps -aq --filter "name=pasalapeli" | xargs -r docker rm -f
+
 log "Levantando el stack completo"
 cd "$APP_DIR/pasalapeli-database"
 docker compose up -d --build
