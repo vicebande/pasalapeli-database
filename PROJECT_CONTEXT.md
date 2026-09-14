@@ -543,3 +543,106 @@ Se revisaron todos los archivos del flujo (compose, workflows, Dockerfiles, ngin
 **Docs sincronizados:** `PROJECT_CONTEXT.md` maestro + 5 copias idénticas (hash `EDAC3DA3AFE1A09ABC83271EB339E62C`); `Diagramas/05_base_datos_UML.txt` actualizado con `cantidad` en `Ticket` (validado con plantuml -checkonly, exit 0). Se eliminaron las notas de "producción madura" no esenciales del §9.9.
 
 **Estado final:** repos `main` en sync con `origin/main` (0 ahead / 0 behind), working trees limpios. Commits pusheados: ticket `9d01359`, database `a23c4d5`, bff `89c7b4f`, movie `a000473`, frontend `5584952` (world) + fixes de código listados arriba.
+
+## 13. DESPLIEGUE REAL EN AWS — TOPOLOGÍA 3 EC2 DESPLEGADA Y VERIFICADA (12/09/2026)
+
+**Contexto:** Se desplegó por primera vez la topología completa de 3 EC2 en AWS y se cerró la sesión con **APPS healthy (bff/movie/ticket)**, **WEB healthy (frontend)** y la app accesible vía `https://<IP_WEB>` (certificado autofirmado, modo pruebas sin dominio).
+
+### 13.1 Infraestructura AWS REAL (consola AWS)
+
+- 3 instancias **Ubuntu 24.04** con **Elastic IP** cada una (SSH por IP pública).
+- **Subredes reales** (al lanzar con "VPC and more", AWS genera CIDR `/20`, NO los `/24` de la guía):
+  - `WEB` → `10.0.0.0/20` — IP privada de WEB real: `10.0.6.8`
+  - `APPS` → `10.0.16.0/20` — IP privada de APPS real: `10.0.25.197`
+  - `BDD` → `10.0.32.0/20` — IP privada de BDD real: `10.0.40.200` (3ª subred, creada a mano)
+- **Security Groups por REFERENCIA A OTRO SG** (no CIDR `/24` como la guía): BDD `3306` ← `sg-pasalapeli-apps`; APPS `8080` ← `sg-pasalapeli-web`; WEB `80/443` público; `22` solo a la IP del desarrollador. OJO: AWS NO permite convertir una regla CIDR existente a referencia de SG → hay que borrar y recrear la regla.
+- **Main route table sin ruta default** → se agregó `0.0.0.0/0 → IGW` a mano (sin ella, `apt-get` y las salidas a internet de BDD fallaban).
+- **PENDIENTE DOCS:** la `Guia-Despliegue-AWS-Azure.txt` (PARTE 1.5 y ANEXO) aún describe subredes `/24` + CIDR por IP; hay que alinearla a `/20` + referencia a SG + paso de la ruta al IGW.
+
+### 13.2 Base de datos (EC2-BDD)
+
+- MySQL 8 **nativo** (sin Docker). Usuario `pasalapeli@'%'` (`caching_sha2_password`), DB `pasalapeli_db`, **5 tablas** cargadas desde `init.sql`. Los microservicios la alcanzan por `jdbc:mysql://<IP_PRIVADA_BDD>:3306`.
+
+### 13.3 Cómo quedó el deploy (modo pruebas SIN dominio)
+
+- Sin dominio → **certificado autofirmado** en WEB (la advertencia del navegador es esperada), **Azure deshabilitado** (no se crean secrets `AZURE_*`), **CORS `*`** (no se crea `CORS_ALLOWED_ORIGINS`).
+- `EC2_APPS_HOST` = **IP PRIVADA de APPS** (`10.0.25.197`): el proxy `/api` de nginx usa esa IP (resuelve al arranque). **Nunca** usar el hostname `bff-service` (solo existe en la topología single-EC2).
+
+### 13.4 Secrets y Variables finales en GitHub
+
+| Ítem | Repos | Valor |
+| :--- | :--- | :--- |
+| Secret `EC2_HOST` | database, bff-service, movie-service, ticket-service | IP **pública** de EC2-APPS |
+| Secret `EC2_HOST` | frontend | IP **pública** de EC2-WEB |
+| Secret `EC2_USER` | los 5 | `ubuntu` |
+| Secret `EC2_SSH_KEY` | los 5 | contenido del `.pem` |
+| Secret `SPRING_DATASOURCE_URL` | database | `jdbc:mysql://10.0.40.200:3306/pasalapeli_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC` |
+| Secret `SPRING_DATASOURCE_USERNAME` | database | `pasalapeli` |
+| Secret `SPRING_DATASOURCE_PASSWORD` | database | `P3li!2026M0vieDbQwz` |
+| Variable `EC2_APPS_HOST` | frontend | `10.0.25.197` (IP **privada** de APPS) — obligatoria |
+
+- `EC2_DOMAIN` / `CERTBOT_EMAIL` **vacías** (modo pruebas) en database y frontend.
+- La IP de la BDD vive **solo** en el secret `SPRING_DATASOURCE_URL`; el `.env` en `/opt/pasalapeli/pasalapeli-database/.env` la reparte a los 3 contenedores vía compose.
+
+### 13.5 Bugs de pipelines encontrados y corregidos (12/09/2026)
+
+| Fallo observado | Causa raíz | Fix aplicado |
+| :--- | :--- | :--- |
+| Bootstrap: `Permission denied` al escribir `privkey.pem` | `bootstrap-ec2.sh` hacía `sudo chown` NO recursivo sobre `/opt/pasalapeli` → `certs/` quedaba root | `sudo chown -R "$(whoami)" "$APP_DIR"` (database `c978b4c`) |
+| Bootstrap: `unable to prepare context: path ".../pasalapeli-movie-service" not found` | `REPO_OWNER` / `DOMAIN` / `CERTBOT_EMAIL` no se exportaban a `bootstrap-ec2.sh` (solo `APP_BASE_URL`, `CORS`, `SPRING_DATASOURCE_URL`) → el loop de clonado se saltaba | `export APP_BASE_URL CERTBOT_EMAIL CORS_ALLOWED_ORIGINS DOMAIN REPO_OWNER SPRING_DATASOURCE_URL` (database `38cb96f`) |
+| Deploy de bff/movie/ticket: `Error: missing server host` | Faltaban los secrets `EC2_USER` y `EC2_SSH_KEY` en esos 3 repos (solo existía `EC2_HOST`) | Secrets seteados vía `gh secret set` (EC2_SSH_KEY leído de `D:\Pasa La Peli\pasalapeli-key.pem`) |
+| nginx crash-loop: `[emerg] host not found in upstream "bff-service"` | Variable `EC2_APPS_HOST` **no existía** en el repo frontend → caía al fallback `bff-service`, que no resuelve en EC2-WEB | Creada la Variable `EC2_APPS_HOST=10.0.25.197`; además `deploy.yml` ahora **exige** la variable con mensaje claro en vez del fallback (frontend `9db9241`) |
+| Frontend `unhealthy` constante (nginx corriendo) | El HEALTHCHECK `wget https://localhost/` resolvía `localhost` a `[::1]:443` (IPv6) y nginx escucha solo IPv4 | HEALTHCHECK con `https://127.0.0.1/` (frontend `189c141`) |
+
+Además se creó `database/scripts/bootstrap-web.sh` (autoprepara EC2-WEB: Docker, clon de database+frontend, cert autofirmado o Let's Encrypt según `EC2_DOMAIN`, cron de renovación) y `frontend/.github/workflows/deploy.yml` quedó como **deploy único** (baja el script, lo ejecuta, `git pull` + `docker compose -f docker-compose.web.yml up -d --build frontend`, healthcheck, verificación HTTPS).
+
+### 13.6 Estado verificado al cierre
+
+- **APPS**: `bff-service` :8080, `movie-service` :8082, `ticket-service` :8083 — **healthy** (bootstrap success 2m48s; deploys individuales verdes 13–21 s).
+- **WEB**: contenedor `pasalapeli-frontend` **healthy** (deploy 54 s). Sitio accesible en el navegador por `https://<IP_WEB>` (IP pública WEB = `100.63.21.68`); se acepta la advertencia self-signed (MOZILLA_PKIX_ERROR_SELF_SIGNED_CERT esperado) y carga la cartelera.
+- Todos los repos en `main` sincronizado con `origin/main`; working trees limpios.
+
+### 13.7 Para agentes futuros
+
+- Para activar un **dominio real**: crear variables `EC2_DOMAIN` + `CERTBOT_EMAIL` en `pasalapeli-frontend` (y `EC2_DOMAIN`/`CERTBOT_EMAIL` en `pasalapeli-database` si se quiere cert en APPS). El flujo emitirá Let's Encrypt **antes** de levantar el contenedor y el workflow verificará HTTPS. No hacerlo a mano.
+- Para redesplegar un servicio puntual en APPS: push a su repo (workflow `Deploy X a EC2`, ya verdes) o `workflow_dispatch`. El bootstrap sigue disponible y es re-ejecutable (idempotente).
+- **CUIDADO**: la clave `D:\Pasa La Peli\pasalapeli-key.pem` es sensible — nunca pushearla a GitHub (no está en ningún repo).
+- Pendiente opcional: sincronizar `Guia-Despliegue-AWS-Azure.txt` PARTE 1.5/ANEXO con subredes `/20`, SG por referencia y ruta al IGW (§13.1).
+
+## 14. CAMBIO: PORTADAS EN ALMACENAMIENTO LOCAL - ELIMINACIÓN DE S3 (14/09/2026)
+
+### 14.1 Contexto
+
+El lab AWS (Vocareum) bloquea `iam:CreateUser`, `iam:CreateRole` y `access-analyzer:ValidatePolicy`, por lo que no se pudo crear un IAM user/role para usar S3. El intento con credenciales anónimas (`AnonymousCredentialsProvider`, movie-service `0df922b`) terminaba cayendo al fallback local, así que se decidió **eliminar S3 completamente**: las portadas se guardan hoy localmente en EC2-APPS mediante el volumen Docker `movie-uploads` y se sirven al navegador a través de nginx (EC2-WEB) → movie-service:8082.
+
+### 14.2 Cambios aplicados (commits `7378960`, `d15565a`, `00eca1b`)
+
+**Movie Service** (`pasalapeli-movie-service`):
+- Creado `LocalStorageService.java`: sube/elimina archivos en `storage.local.upload-dir` (default `./uploads/peliculas`).
+- Eliminados `S3StorageService.java` y `AwsS3Config.java`.
+- `PeliculaService`/`PeliculaController`: usan `LocalStorageService`; la URL resultante es `/uploads/<archivo>`.
+- `pom.xml`: eliminada la dependencia AWS SDK S3 y `aws.sdk.version`.
+- `application.yml`: eliminado el bloque `aws:`; se usa `storage.local.upload-dir`.
+- `WebMvcConfig`: mapea `/uploads/**` → `storage.local.upload-dir`.
+- `MovieServiceApplicationTests`: eliminada la propiedad `aws.s3.enabled=false`.
+
+**Database / orquestador** (`pasalapeli-database`):
+- `docker-compose.yml`: movie-service ahora publica `ports: ["8082:8082"]`; eliminadas las env `AWS_S3_*`.
+- `bootstrap.yml`, `scripts/bootstrap-ec2.sh`, `.env.example`: eliminadas `AWS_S3_ENABLED`, `AWS_S3_BUCKET`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
+- Eliminadas las GitHub Actions variables `AWS_S3_ENABLED`, `AWS_S3_BUCKET`, `AWS_REGION` del repo.
+
+**Frontend** (`pasalapeli-frontend`):
+- `nginx.conf`: nuevo `location /uploads/` que proxya a `A_PONE_APPS_HOST:8082` (movie-service en EC2-APPS).
+- `admin.component.html|ts`: textos "Amazon S3" reemplazados por versión local.
+- `cartelera.component.html`, `pelicula-detalle.component.html`, `index.html`, `navbar.component.html`, `admin.component.html`: eliminadas todas las menciones visibles a Cloud/AWS/Azure/EC2/S3 (branding neutro).
+
+### 14.3 Verificado
+
+- Bootstrap run `34813891967` success; deploys verdes (movie `34813747677`, database push, frontend `34813749623`).
+- Regla inbound **TCP 8082** en el Security Group de EC2-APPS con origen EC2-WEB (confirmada manualmente por el usuario).
+- Subida y visualización de portadas funcional desde `/admin`.
+
+### 14.4 Para agentes futuros
+
+- Si se quiere volver a un object storage (S3), el proyecto necesita IAM user/role válidos en AWS (el lab de Vocareum no lo permite) y restaurar la dependencia SDK + `S3StorageService`.
+- Las imágenes viven en el volumen `movie-uploads` de EC2-APPS (persistente entre deploys).
