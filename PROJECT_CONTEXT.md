@@ -693,9 +693,10 @@ Se reportaron 4 incidencias: (1) la simulación de pago "dice que falló" pero e
 
 **Incidente:** al pushear los 4 repos a la vez, los workflows de movie-service y bff-service corrieron en paralelo contra el mismo EC2-APPS y `docker compose up` chocó (`container name "/pasalapeli-movie" is already in use`). movie y bff no quedaron recreados; sin contenedor `pasalapeli-bff` toda la API devolvía 502 (`/api/auth/me`, `/api/cartelera`, `/api/tickets`).
 
-**Solución aplicada en los 4 `deploy.yml`:**
-- Lock compartido en el host con `flock -x -w 1800 /tmp/pasalapeli-deploy.lock` (fd 9), que serializa `docker compose up -d --build` entre repos sobre el mismo EC2 (APPS para movie/ticket/bff; WEB para frontend). Si un deploy se demora >30 min, falla en vez de estrellarse.
+**Solución aplicada en los 4 `deploy.yml` y en el `bootstrap.yml` de database:**
+- Lock compartido en el host con `flock -x -w 1800 /tmp/pasalapeli-deploy.lock` (fd 9), que serializa `docker compose up -d --build` entre repos sobre el mismo EC2 (APPS para movie/ticket/bff + bootstrap; WEB para frontend). Si un deploy se demora >30 min, falla en vez de estrellarse.
 - Liberación explícita `flock -u 9`; ante fallo, el cierre del fd por salida del script libera el lock igualmente.
+- `bootstrap.yml` (database): además recibe `concurrency: { group: bootstrap-ec2-pasalapeli, cancel-in-progress: true }` para que un push nuevo cancele un bootstrap previo en cola (un push de solo docs no debería re-bootstrapear todo).
 
 **Recuperación manual usada:** entrar por SSH a EC2-APPS y ejecutar en secuencia `docker compose -f /opt/pasalapeli/pasalapeli-database/docker-compose.yml up -d --build <servicio>`; verificar `.State.Health.Status` = `healthy` y `curl` al `/api/cartelera` desde EC2-WEB.
 

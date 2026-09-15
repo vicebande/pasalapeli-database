@@ -5,6 +5,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Evita acumular runs de bootstrap: un push nuevo cancela el anterior en curso.
+concurrency:
+  group: bootstrap-ec2-pasalapeli
+  cancel-in-progress: true
+
 jobs:
   bootstrap:
     name: Setup EC2 y despliegue completo
@@ -34,6 +39,14 @@ jobs:
           envs: MYSQL_ROOT_PASSWORD,SPRING_DATASOURCE_USERNAME,SPRING_DATASOURCE_PASSWORD,AZURE_AUTH_ENABLED,AZURE_CLIENT_ID,AZURE_TENANT_ID,AZURE_APP_ID_URI,AZURE_AD_ISSUER_URI,AZURE_AD_JWK_SET_URI,SPRING_DATASOURCE_URL,CORS_ALLOWED_ORIGINS
           script: |
             set -euo pipefail
+
+            # Lock compartido con los deploys por-repo (movie/ticket/bff) sobre EC2-APPS:
+            # el bootstrap tambien ejecuta docker compose up y no debe correr en paralelo.
+            LOCKFILE=/tmp/pasalapeli-deploy.lock
+            exec 9>"$LOCKFILE"
+            flock -x -w 1800 9
+            echo "==> Lock adquirido $LOCKFILE (bootstrap)"
+
             REPO_OWNER="${{ github.repository_owner }}"
             CERTBOT_EMAIL="${{ vars.CERTBOT_EMAIL }}"
             DOMAIN="${{ vars.EC2_DOMAIN }}"
@@ -75,3 +88,4 @@ jobs:
             export FORCE_ENV=true
 
             bash scripts/bootstrap-ec2.sh
+            flock -u 9
