@@ -749,3 +749,13 @@ Se reportaron 4 incidencias: (1) la simulación de pago "dice que falló" pero e
 - **Causa:** el esquema (`init.sql`) definía `sala` como `VARCHAR(20)`, pero las opciones del `<select>` del panel admin incluyen nombres de sala de hasta 23 caracteres ("Sala 4 - 2D Tradicional").
 - **Fix:** `sala VARCHAR(50)` en `database/init.sql` + `ALTER TABLE Funcion MODIFY sala VARCHAR(50) NOT NULL` aplicado en vivo en EC2-BDD (`10.0.40.200`). Verificado con `information_schema` (varchar(50)).
 - **Regla:** MySQL en modo strict rechaza valores más largos que el tipo de la columna ("Data too long"); al tocar esquema, alinear `init.sql` con `information_schema` y aplicar el ALTER en los entornos donde la tabla ya existe.
+
+### 15.11 Causa raíz real: Hibernate `ddl-auto: update` revierte el esquema (15/09/2026)
+
+- **Síntoma recurrente:** tras aplicar el ALTER (15.10) y verificar `varchar(50)`, la columna volvió a `varchar(20)` y el error "Data too long for column 'sala'" reapareció.
+- **Causa raíz (confirmada con binlog en EC2-BDD):** `spring.jpa.hibernate.ddl-auto: update` en movie-service y ticket-service. Cada vez que arranca un contenedor, Hibernate compara las entidades contra la BDD y ejecuta ALTERs; la entidad `Funcion.sala` tenía `@Column(length = 20)`, así que Hibernate emitía `alter table Funcion modify column sala varchar(20) not null` al desplegar movie-service, revirtiendo el fix. Los redeploys posteriores al ALTER lo deshicieron.
+- **Fix definitivo:**
+  - `movie-service/.../entity/Funcion.java`: `@Column(length = 20)` → `length = 50` (commit movie `529182c`).
+  - `application.yml` de movie-service y ticket-service: `ddl-auto: update` → `ddl-auto: none` (commits movie `529182c`, ticket `0a6f3ce`). El esquema se gestiona SOLO vía `database/init.sql` + ALTERs manuales; Hibernate ya no muta la BDD.
+  - Re-aplicado `ALTER TABLE Funcion MODIFY sala VARCHAR(50) NOT NULL` y verificado `varchar(50)` (los contenedores ya no lo revierten).
+- **Lección:** `ddl-auto: update` es peligroso en producción: Hibernate puede encoger columnas según la metadata de las entidades. Con esquema centralizado en `init.sql`, usar `ddl-auto: none`. Ante síntomas que "vuelven solos", revisar binlog/general_log antes de suponer re-seed.
