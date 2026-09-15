@@ -646,3 +646,45 @@ El lab AWS (Vocareum) bloquea `iam:CreateUser`, `iam:CreateRole` y `access-analy
 
 - Si se quiere volver a un object storage (S3), el proyecto necesita IAM user/role válidos en AWS (el lab de Vocareum no lo permite) y restaurar la dependencia SDK + `S3StorageService`.
 - Las imágenes viven en el volumen `movie-uploads` de EC2-APPS (persistente entre deploys).
+
+## 15. DEVOLUCIÓN DE TICKETS + FIX MODAL DE COMPRA + DIAGNÓSTICO FUNCIONES (14/09/2026)
+
+### 15.1 Contexto
+
+Se reportaron 4 incidencias: (1) la simulación de pago "dice que falló" pero el ticket sí se crea en "Mis Entradas"; (2) el modal de compra no se cerraba ni redirigía a `/mis-tickets` al terminar; (3) en el panel admin solo se podía agregar UNA fecha/función a una película (la segunda fallaba); (4) faltaba poder DEVOLVER tickets y que se liberaran los asientos.
+
+### 15.2 Cambios aplicados
+
+**movie-service**:
+- `FuncionService.reponerEntradas(funcionId, cantidad)` + endpoint `PUT /api/funciones/{id}/reponer?cantidad=N`: con lock pesimista (`findByIdForUpdate`) suma cupos a `entradas_disponibles` y devuelve `DisponibilidadDTO`. Es la contraparte de `/descontar`.
+- `GlobalExceptionHandler.handleGeneric`: ahora usa `@Slf4j` y loguea la excepción con stacktrace para visibilizar errores no controlados (diagnóstico del punto 3).
+
+**ticket-service**:
+- `TicketService.devolverTicket(id)`: 404 si no existe; 409 (nueva excepción `TicketYaDevueltoException`) si `estado != PAGADO`; llama `MovieServiceClient.reponerEntradas` para liberar `cantidad` asientos y marca el ticket `CANCELADO` (el `Pago` queda como historial). Devuelve el DTO actualizado.
+- `MovieServiceClient.reponerEntradas`: PUT a movie-service `/api/funciones/{id}/reponer`.
+- `TicketController`: `POST /api/tickets/{id}/devolver` → 200 con DTO.
+
+**bff-service**:
+- `TicketClient.devolverTicket(id)`: POST a ticket-service con mapeo de errores estructurados.
+- `TicketBffController`: `POST /api/tickets/{id}/devolver` (autenticado); verifica que `ticket.usuarioId == usuario resuelto` (si no → 403). Regla: la devolución solo la puede realizar el dueño.
+
+**frontend**:
+- `ticket.service.ts`: `devolverTicket(id)` → `POST /api/tickets/{id}/devolver`.
+- `mis-tickets`: botón **"Devolución"** (icono `fa-rotate-left`, estilo `btn-refund`) solo en tickets `PAGADO`; `confirm()` avisa que se simula la devolución, el ticket queda ANULADO y se liberan los asientos; tras éxito recarga la lista y muestra `mensajeExito`. Añadido `.success-banner` local.
+- `compra-ticket.component.ts`:
+  - Guard `compraEnCurso` a nivel JS: elimina el doble POST (la causa del "falso 409": el 1º creaba el ticket y el 2º respondía 409, dejando el modal abierto y sin redirigir).
+  - `confirmarPago` → llama directo a `confirmarCompra` (un solo flujo, sin timer frágil previo). Spinner mínimo de 1.2 s (`finalizarCompraExitosa`).
+  - Éxito → SIEMPRE `cerrar.emit()` + `router.navigate(['/mis-tickets'])`.
+  - Error no-409 → `verificarCompraRealizada`: consulta `GET /api/tickets` y si existe un ticket de la misma función/cantidad con `fechaCompra` reciente (≤2 min) lo trata como éxito (modo "falso error"); si no, muestra el error real.
+- `admin.component.ts`: `guardarFuncion` muestra `err.error?.message` real (y `console.error`) en vez del `alert('Error al guardar la función.')` genérico, para destapar la causa del punto 3.
+
+### 15.3 Notas de diseño
+
+- **Devolución = CANCELADO, no DELETE**: el ticket permanece en el historial como evidencia (estado enum ya existía). Los asientos se liberan vía movie-service `/reponer` con lock pesimista (misma consistencia que `/descontar`).
+- El `Pago` se conserva tal cual (historial de la transacción); la "devolución" se simula con el estado del ticket.
+- El admin "segunda función" no tiene bloqueo en `init.sql` (sin UNIQUE en `Funcion`); el fix inmediato es visibilizar el error real para conocer la causa exacta.
+
+### 15.4 Para agentes futuros
+
+- Al comprar, NUNCA disparar dos POST de `/api/tickets/comprar` para la misma compra: usar el guard `compraEnCurso` del modal (o idempotencia servidor).
+- El endpoint de devolución está en BFF `/api/tickets/{id}/devolver` (dueño) → ticket-service → movie-service `/reponer`. Mantener el orden: reponer cupos + cambiar estado en la misma transacción del ticket-service.
