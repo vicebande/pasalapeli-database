@@ -688,3 +688,15 @@ Se reportaron 4 incidencias: (1) la simulación de pago "dice que falló" pero e
 
 - Al comprar, NUNCA disparar dos POST de `/api/tickets/comprar` para la misma compra: usar el guard `compraEnCurso` del modal (o idempotencia servidor).
 - El endpoint de devolución está en BFF `/api/tickets/{id}/devolver` (dueño) → ticket-service → movie-service `/reponer`. Mantener el orden: reponer cupos + cambiar estado en la misma transacción del ticket-service.
+
+### 15.5 Hardening de deploys (15/09/2026): lock entre repos
+
+**Incidente:** al pushear los 4 repos a la vez, los workflows de movie-service y bff-service corrieron en paralelo contra el mismo EC2-APPS y `docker compose up` chocó (`container name "/pasalapeli-movie" is already in use`). movie y bff no quedaron recreados; sin contenedor `pasalapeli-bff` toda la API devolvía 502 (`/api/auth/me`, `/api/cartelera`, `/api/tickets`).
+
+**Solución aplicada en los 4 `deploy.yml`:**
+- Lock compartido en el host con `flock -x -w 1800 /tmp/pasalapeli-deploy.lock` (fd 9), que serializa `docker compose up -d --build` entre repos sobre el mismo EC2 (APPS para movie/ticket/bff; WEB para frontend). Si un deploy se demora >30 min, falla en vez de estrellarse.
+- Liberación explícita `flock -u 9`; ante fallo, el cierre del fd por salida del script libera el lock igualmente.
+
+**Recuperación manual usada:** entrar por SSH a EC2-APPS y ejecutar en secuencia `docker compose -f /opt/pasalapeli/pasalapeli-database/docker-compose.yml up -d --build <servicio>`; verificar `.State.Health.Status` = `healthy` y `curl` al `/api/cartelera` desde EC2-WEB.
+
+**Regla:** con el lock ya es seguro empujar los repos casi a la vez (se encolan), pero para un release conviene mantener pushes secuenciales y esperar que cada workflow quede verde.
