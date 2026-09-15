@@ -660,7 +660,7 @@ Se reportaron 4 incidencias: (1) la simulación de pago "dice que falló" pero e
 - `GlobalExceptionHandler.handleGeneric`: ahora usa `@Slf4j` y loguea la excepción con stacktrace para visibilizar errores no controlados (diagnóstico del punto 3).
 
 **ticket-service**:
-- `TicketService.devolverTicket(id)`: 404 si no existe; 409 (nueva excepción `TicketYaDevueltoException`) si `estado != PAGADO`; llama `MovieServiceClient.reponerEntradas` para liberar `cantidad` asientos y marca el ticket `CANCELADO` (el `Pago` queda como historial). Devuelve el DTO actualizado.
+- `TicketService.devolverTicket(id)`: 404 si no existe; 409 (nueva excepción `TicketYaDevueltoException`) si `estado != PAGADO`; llama `MovieServiceClient.reponerEntradas` para liberar `cantidad` asientos y **elimina físicamente el ticket** (`ticketRepository.delete`); el `Pago` cae en cascada (FK `ON DELETE CASCADE`). Devuelve el DTO construido antes del borrado.
 - `MovieServiceClient.reponerEntradas`: PUT a movie-service `/api/funciones/{id}/reponer`.
 - `TicketController`: `POST /api/tickets/{id}/devolver` → 200 con DTO.
 
@@ -670,7 +670,7 @@ Se reportaron 4 incidencias: (1) la simulación de pago "dice que falló" pero e
 
 **frontend**:
 - `ticket.service.ts`: `devolverTicket(id)` → `POST /api/tickets/{id}/devolver`.
-- `mis-tickets`: botón **"Devolución"** (icono `fa-rotate-left`, estilo `btn-refund`) solo en tickets `PAGADO`; `confirm()` avisa que se simula la devolución, el ticket queda ANULADO y se liberan los asientos; tras éxito recarga la lista y muestra `mensajeExito`. Añadido `.success-banner` local.
+- `mis-tickets`: botón **"Devolución"** (icono `fa-rotate-left`, estilo `btn-refund`) solo en tickets `PAGADO`; abre **modal de 2da confirmación** (`.modal-backdrop` + `.refund-modal`) con resumen del ticket (película, entradas, asientos a liberar, monto) y botones Cancelar / Confirmar; tras éxito recarga la lista (el ticket eliminado ya no aparece) y muestra `mensajeExito`.
 - `compra-ticket.component.ts`:
   - Guard `compraEnCurso` a nivel JS: elimina el doble POST (la causa del "falso 409": el 1º creaba el ticket y el 2º respondía 409, dejando el modal abierto y sin redirigir).
   - `confirmarPago` → llama directo a `confirmarCompra` (un solo flujo, sin timer frágil previo). Spinner mínimo de 1.2 s (`finalizarCompraExitosa`).
@@ -680,14 +680,14 @@ Se reportaron 4 incidencias: (1) la simulación de pago "dice que falló" pero e
 
 ### 15.3 Notas de diseño
 
-- **Devolución = CANCELADO, no DELETE**: el ticket permanece en el historial como evidencia (estado enum ya existía). Los asientos se liberan vía movie-service `/reponer` con lock pesimista (misma consistencia que `/descontar`).
-- El `Pago` se conserva tal cual (historial de la transacción); la "devolución" se simula con el estado del ticket.
+- **Devolución = DELETE**: a pedido del cliente, la devolución elimina el ticket (y su `Pago` en cascada) para que no figure más en "Mis Entradas"; la liberación de asientos sigue vía movie-service `/reponer` con lock pesimista (misma consistencia que `/descontar`).
+- El `Pago` ya no queda como historial: el delete del `Ticket` lo borra en cascada (FK `Pago.ticket_id -> Ticket.id` con `ON DELETE CASCADE`).
 - El admin "segunda función" no tiene bloqueo en `init.sql` (sin UNIQUE en `Funcion`); el fix inmediato es visibilizar el error real para conocer la causa exacta.
 
 ### 15.4 Para agentes futuros
 
 - Al comprar, NUNCA disparar dos POST de `/api/tickets/comprar` para la misma compra: usar el guard `compraEnCurso` del modal (o idempotencia servidor).
-- El endpoint de devolución está en BFF `/api/tickets/{id}/devolver` (dueño) → ticket-service → movie-service `/reponer`. Mantener el orden: reponer cupos + cambiar estado en la misma transacción del ticket-service.
+- El endpoint de devolución está en BFF `/api/tickets/{id}/devolver` (dueño) → ticket-service → movie-service `/reponer`. Mantener el orden: reponer cupos + eliminar el ticket en la misma transacción del ticket-service.
 
 ### 15.5 Hardening de deploys (15/09/2026): lock entre repos
 
