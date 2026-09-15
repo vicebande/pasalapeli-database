@@ -759,3 +759,12 @@ Se reportaron 4 incidencias: (1) la simulación de pago "dice que falló" pero e
   - `application.yml` de movie-service y ticket-service: `ddl-auto: update` → `ddl-auto: none` (commits movie `529182c`, ticket `0a6f3ce`). El esquema se gestiona SOLO vía `database/init.sql` + ALTERs manuales; Hibernate ya no muta la BDD.
   - Re-aplicado `ALTER TABLE Funcion MODIFY sala VARCHAR(50) NOT NULL` y verificado `varchar(50)` (los contenedores ya no lo revierten).
 - **Lección:** `ddl-auto: update` es peligroso en producción: Hibernate puede encoger columnas según la metadata de las entidades. Con esquema centralizado en `init.sql`, usar `ddl-auto: none`. Ante síntomas que "vuelven solos", revisar binlog/general_log antes de suponer re-seed.
+
+### 15.12 Fix: recarga en `/admin` bloqueaba con "Acceso restringido" (15/09/2026)
+
+- **Síntoma:** estando logueado con una cuenta ADMIN, al recargar la página en `/admin` aparecía el alert "Acceso restringido: Se requiere rol de Administrador." y se redirigía a `/cartelera`, como si la sesión no se guardara.
+- **Causa:** `AdminGuard.canActivate()` y `AuthGuard.canActivate()` eran síncronos y corrían ANTES de que MSAL restaurara la sesión desde `localStorage` (evento `InteractionStatus.None`). En ese instante `currentUserSubject` estaba `null` → `isAdmin()` daba `false`. La sesión SÍ estaba persistida (MSAL), el guard no la esperaba. El rol ADMIN proviene del claim `roles` del token de Entra AD.
+- **Fix (frontend `3701482`):**
+  - `AuthService.waitForAuthReady(): Promise<UserProfile|null>`: en Azure espera el primer `InteractionStatus.None` (`take(1)` + timeout 8s), llama `ensureActiveAccount()` (activa la primera cuenta si `getActiveAccount()` es nulo tras la recarga), `checkActiveAccount()` y `sincronizarPerfilConBFF()` (fuente de verdad del rol). En modo demo resuelve inmediato.
+  - `AdminGuard` y `AuthGuard` ahora son `async` y hacen `await authService.waitForAuthReady()` antes de evaluar roles/autenticación.
+- **Seguridad intacta:** la protección real está en el backend (`/api/admin/**` → `hasRole("ADMIN")` en `SecurityConfig`; roles leídos del claim `roles` del JWT por `JwtAuthConverter`). Usuarios CLIENTE o deslogueados siguen bloqueados por el guard al intentar `/admin`.
