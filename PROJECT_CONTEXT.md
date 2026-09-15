@@ -701,3 +701,19 @@ Se reportaron 4 incidencias: (1) la simulación de pago "dice que falló" pero e
 **Recuperación manual usada:** entrar por SSH a EC2-APPS y ejecutar en secuencia `docker compose -f /opt/pasalapeli/pasalapeli-database/docker-compose.yml up -d --build <servicio>`; verificar `.State.Health.Status` = `healthy` y `curl` al `/api/cartelera` desde EC2-WEB.
 
 **Regla:** con el lock ya es seguro empujar los repos casi a la vez (se encolan), pero para un release conviene mantener pushes secuenciales y esperar que cada workflow quede verde.
+
+### 15.6 FIX ESTRUCTURAL: mayúsculas vs minúsculas en la BDD (15/09/2026)
+
+**Hallazgo:** Hibernate 6 (ORM 6.5.2) minúsculiza los nombres EXPLÍCITOS no comillados de `@Table(name = "Pelicula")` en su estrategia de naming por defecto. Por eso movie-service y ticket-service terminaron creando/leyendo tablas `pelicula`, `funcion`, `ticket`, `pago`, `usuario` (minúsculas) e IGNORARON el esquema de `init.sql` (mayúsculas: `Pelicula`, `Funcion`, `Ticket`, `Pago`, `Usuario`). En prod: movie no veía las funciones del seed (`/api/funciones/1/disponibilidad` → 404), la cartelera mostraba solo "Niu Lai"/"La Odisea" con `funciones: []` y comprar/devolver fallaban al reponer/descontar.
+
+**Solución (código):** en `movie-service` y `ticket-service`, `spring.jpa.hibernate.naming.physical-strategy: org.hibernate.boot.model.naming.PhysicalNamingStrategyStandardImpl` (preserva los nombres explícitos). bff no tiene persistencia directa. Commits: movie `2f2286c`, ticket `fd93425` (workflows verdes).
+
+**Migración aplicada en EC2-BDD (10.0.40.200/pasalapeli_db):**
+- Usuarios reales de Azure insertados en `Usuario` (mayúsculas) con ids 4-6: vi.banderas@duocuc.cl, cliente@pasalapeli.onmicrosoft.com, mart.vergaral@duocuc.cl.
+- Stock de `Funcion` restablecido al seed exacto: 45,50,30,40,60,1,50,50,55.
+- Eliminados TODOS los tickets/pagos (mayúsculas y minúsculas) a pedido del cliente; "Mis Entradas" queda vacío.
+- DROP de las tablas minúsculas huérfanas (`pago, ticket, funcion, pelicula, usuario`); la BDD final coincide con `init.sql` (`Usuario, Pelicula, Funcion, Ticket, Pago`).
+
+**Validación E2E post-fix:** comprar (usuario 5, función 1, cantidad 2) → ticket PAGADO + pago creados en `Ticket`/`Pago`, stock 45→43; `POST /api/tickets/{id}/devolver` → 200, ticket y pago ELIMINADOS, stock 45. Cartelera pública OK (catálogo seed con funciones y stock).
+
+**Regla:** NO incorporar `@Table`/`@Column` asumiendo el caso exacto: Hibernate 6 minúsculiza identificadores no comillados. Mantener `PhysicalNamingStrategyStandardImpl` en los repos con JPA y validar contra `information_schema` + E2E comprar→devolver→stock luego de cualquier cambio de datasource/jpa.
