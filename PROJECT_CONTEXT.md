@@ -78,7 +78,7 @@ El modelo cumple con `Diagramas/Diagrama BDD.png`:
    - `id`: BIGINT PK AUTO_INCREMENT
    - `fecha`: DATE
    - `hora`: TIME
-   - `sala`: VARCHAR(20)
+   - `sala`: VARCHAR(50)
    - `entradas_disponibles`: INT
    - `precio`: DECIMAL(10,2)
    - `pelicula_id`: BIGINT FK -> `Pelicula(id)` (ON DELETE CASCADE)
@@ -742,3 +742,10 @@ Se reportaron 4 incidencias: (1) la simulación de pago "dice que falló" pero e
 - **Requisito:** al pulsar "Iniciar Sesión" debe aparecer un modal con Términos y Condiciones; el botón de login queda deshabilitado hasta marcar la casilla de aceptación. Solo entonces se dispara el flujo OAuth2 de Microsoft (MSAL `loginRedirect`).
 - **Implementación (frontend `0edbeb9`):** nuevo componente standalone `components/terminos` (`TerminosComponent` con `@Output` `aceptado`/`rechazado`). `NavbarComponent.login()` ya NO llama directo a `authService.login()`: abre el modal; `aceptarTerminos()` cierra el modal y recién ahí llama a `authService.login()` (que hace `msalService.loginRedirect` a Microsoft Entra ID). Checkbox con `ngModel` (importa `FormsModule`).
 - **Contenido legal (CLP):** Ley N° 19.628 (protección de datos personales), Ley N° 19.496 + Ley N° 21.398 (consumidor; retracto 10 días NO aplica a entradas por tener fecha/hora determinada, pero la plataforma ofrece devolución propia), Ley N° 19.132 (clasificación cinematográfica/edad), Ley N° 19.799 (validez de documentos electrónicos) y emisión de boleta electrónica según SII.
+
+### 15.10 Fix: columna `sala` VARCHAR(20) → VARCHAR(50) (15/09/2026)
+
+- **Síntoma:** al programar una función "Sala 4 - 2D Tradicional" (23 caracteres) el admin recibía 500: `Data too long for column 'sala' at row 1` (MySQL en modo strict) en `insert into Funcion (...,sala,...) values (...)`.
+- **Causa:** el esquema (`init.sql`) definía `sala` como `VARCHAR(20)`, pero las opciones del `<select>` del panel admin incluyen nombres de sala de hasta 23 caracteres ("Sala 4 - 2D Tradicional").
+- **Fix:** `sala VARCHAR(50)` en `database/init.sql` + `ALTER TABLE Funcion MODIFY sala VARCHAR(50) NOT NULL` aplicado en vivo en EC2-BDD (`10.0.40.200`). Verificado con `information_schema` (varchar(50)).
+- **Regla:** MySQL en modo strict rechaza valores más largos que el tipo de la columna ("Data too long"); al tocar esquema, alinear `init.sql` con `information_schema` y aplicar el ALTER en los entornos donde la tabla ya existe.

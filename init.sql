@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS `Funcion` (
   `id` BIGINT NOT NULL AUTO_INCREMENT,
   `fecha` DATE NOT NULL,
   `hora` TIME NOT NULL,
-  `sala` VARCHAR(20) NOT NULL,
+  `sala` VARCHAR(50) NOT NULL,
   `entradas_disponibles` INT NOT NULL DEFAULT 0,
   `precio` DECIMAL(10,2) NOT NULL,
   `pelicula_id` BIGINT NOT NULL,
