@@ -717,3 +717,14 @@ Se reportaron 4 incidencias: (1) la simulación de pago "dice que falló" pero e
 **Validación E2E post-fix:** comprar (usuario 5, función 1, cantidad 2) → ticket PAGADO + pago creados en `Ticket`/`Pago`, stock 45→43; `POST /api/tickets/{id}/devolver` → 200, ticket y pago ELIMINADOS, stock 45. Cartelera pública OK (catálogo seed con funciones y stock).
 
 **Regla:** NO incorporar `@Table`/`@Column` asumiendo el caso exacto: Hibernate 6 minúsculiza identificadores no comillados. Mantener `PhysicalNamingStrategyStandardImpl` en los repos con JPA y validar contra `information_schema` + E2E comprar→devolver→stock luego de cualquier cambio de datasource/jpa.
+
+### 15.7 Operativo de diagnóstico (15/09/2026): accesos, red y consulta BDD
+
+- **EC2-BDD**: IP **privada** `10.0.40.200` = IP **pública** `44.208.65.247` (misma instancia, hostname `ip-10-0-40-200`). MySQL 8 corre **nativo** ahí (no es contenedor). SSH funciona con la misma clave `pasalapeli-key.pem` (usuario `ubuntu`). El puerto 3306 público suele estar cerrado por Security Group: usar siempre la IP privada desde la VPC.
+- **Consulta/scripteo de la BDD desde EC2-APPS** (imagen `mysql:8` ya descargada): subir archivo `.sql` por scp al `/tmp` y ejecutar
+  `docker run -i --rm -v /tmp/x.sql:/tmp/x.sql -e 'MYSQL_PWD=<password pasalapeli>' mysql:8 mysql -h10.0.40.200 -upasalapeli < /tmp/x.sql`.
+  En PowerShell NO usar `-e "SQL"` inline ni `>` / `|` hacia comandos remotos (rompen el parseo): siempre archivo SQL + `<`.
+- **Red interna de contenedores en EC2-APPS**: el compose define `name: pasalapeli`, por lo que la red es **`pasalapeli_pasalapeli-net`** (NO `pasalapeli-net`). Puerto interno de ticket-service = **8083** (NO publicado en el host); movie-service = **8082** (publicado); bff = **8080** (publicado).
+- **Probar endpoints internos** (curl desde la red, puede haber imagen `curlimages/curl`): `docker run --rm --network pasalapeli_pasalapeli-net curlimages/curl -s http://movie-service:8082/...`.
+- **Pista de diagnóstico:** el SQL logueado por Hibernate aparecía en minúscula (`from pelicula p1_0`) → fue la pista del bug de naming (§15.6). Revisar `docker logs <contenedor>` y el `show-sql: true` activo en los services para ver el nombre físico real de cada entidad.
+- **`/proc/net/tcp` del contenedor** sirvió para confirmar a qué IP/puerto real se conecta cada servicio (decodificar IP hex little-endian), útil cuando hay sospechas de datasources duplicados.
