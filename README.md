@@ -2,11 +2,13 @@
 
 Repositorio orquestador de **Pasa La Peli**. Contiene:
 
-- `docker-compose.yml` — stack backend para **EC2-APPS**: `rabbitmq` (broker de mensajería), `movie`, `ticket`, `notification` y `bff`
+- `docker-compose.yml` — stack backend para **EC2-APPS**: `movie`, `ticket`, `notification` y `bff` (mensajería vía AWS SNS/SQS)
 - `docker-compose.web.yml` — stack para **EC2-WEB**: solo el `frontend` (nginx + HTTPS)
 - `init.sql` — script de creación de la base de datos `pasalapeli_db` (9 tablas: Usuario, Pelicula, Funcion, Ticket, Pago, Notificacion, DestinoNotificacion, ReglaDistribucion, MensajeFallido) con datos de prueba
+- `migrations/002-parches.sql` — migración idempotente de los parches de auditoría (aforo, idempotency_key, UNIQUEs)
 - `scripts/bootstrap-ec2.sh` — setup completo de EC2 desde cero (Docker, repos, certificados, deploy)
 - `scripts/renew-certs.sh` — renovación automática de certificados Let's Encrypt
+- `scripts/setup-messaging.sh` — crea topic SNS, cola SQS, DLQ y suscripción con FilterPolicy (idempotente, solo requiere AWS CLI)
 - `.env.example` — plantilla de variables de entorno
 
 ## Despliegue con GitHub Actions
@@ -28,6 +30,14 @@ Repositorio orquestador de **Pasa La Peli**. Contiene:
 |---|---|
 | `EC2_DOMAIN` | Dominio apuntando al EC2 (ej. `peli.midominio.cl`) |
 | `CERTBOT_EMAIL` | Email para certificados Let's Encrypt |
+| `AWS_REGION` | Región AWS (por defecto `us-east-1`) |
+| `SNS_TOPIC_ARN` | ARN del topic SNS (salida de `scripts/setup-messaging.sh`) |
+| `SQS_QUEUE_URL` | URL de la cola SQS de notificaciones (salida de `scripts/setup-messaging.sh`) |
+| `SQS_DLQ_URL` | URL de la DLQ (salida de `scripts/setup-messaging.sh`) |
+
+> El EC2-APPS necesita un **instance profile** (ej. `LabInstanceProfile`) para
+> que los contenedores obtengan credenciales vía IMDS y puedan publicar en SNS
+> / consumir de SQS.
 
 ### Primer despliegue (bootstrap)
 
@@ -42,10 +52,9 @@ Repositorio orquestador de **Pasa La Peli**. Contiene:
 # Solo MySQL (la BDD en producción es EC2-BDD nativo, no contenedor):
 docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=pasalapeli_db mysql:8
 
-# Broker de mensajería (RabbitMQ) para probar notificaciones asincrónicas:
-docker run -d -p 5672:5672 -p 15672:15672 \
-  -e RABBITMQ_DEFAULT_USER=pasalapeli -e RABBITMQ_DEFAULT_PASS=pasalapeli123 \
-  rabbitmq:3.13-management-alpine
+# Mensajeria asincrona (AWS SNS/SQS): crea topic, cola, DLQ y suscripcion.
+# Requiere AWS CLI con credenciales (o un LocalStack/SNS simulado en local).
+./scripts/setup-messaging.sh
 
 # Stack completo en EC2-APPS (requiere que los repos hermanos existan como dirs ../pasalapeli-*)
 docker compose up -d --build

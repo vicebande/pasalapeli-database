@@ -27,9 +27,10 @@ flowchart TD
     BFF --"REST Notificaciones"--> NotifSvc["Notification Service (Spring Boot :8084)"]
 
     TicketSvc --"Consulta Disponibilidad / Descuento (REST)"--> MovieSvc
-    MovieSvc --"Publica eventos de negocio (AMQP)"--> Rabbit["EC2-APPS: RabbitMQ (pasalapeli.events)"]
-    TicketSvc --"Publica eventos de negocio (AMQP)"--> Rabbit
-    Rabbit --"Consume eventos (fan-out por usuario)"--> NotifSvc
+    MovieSvc --"Publica eventos de negocio (SNS)"--> SNS["AWS SNS: pasalapeli-events"]
+    TicketSvc --"Publica eventos de negocio (SNS)"--> SNS
+    SNS --"Suscripcion con FilterPolicy (tipo)"--> SQS["AWS SQS: pasalapeli-notificaciones"]
+    SQS --"Consume eventos (fan-out por usuario)"--> NotifSvc
     MovieSvc --"Persistencia Catálogo & Salas (JDBC :3306)"--> MySQL[("EC2-BDD: MySQL 8.0 (pasalapeli_db)")]
     TicketSvc --"Persistencia Tickets & Pagos (JDBC :3306)"--> MySQL
     NotifSvc --"Persistencia Notificaciones (JDBC :3306)"--> MySQL
@@ -47,10 +48,10 @@ flowchart TD
 | **Frontend** | `frontend/` | Angular 18, MSAL Browser/Angular | `4200` (dev) / `80/443` (prod, nginx en EC2-WEB) | Interfaz de usuario, cartelera, selección de horarios, modal de compra con manejo de HTTP 409, panel de administración con subida de archivos e integración MSAL. Se sirve estático por Nginx en **EC2-WEB**, con proxy `/api` → EC2-APPS:8080. |
 | **BFF Service** | `bff-service/` | Java 21, Spring Boot 3.3, Spring Security OAuth2 | `8080` | Valida técnicamente el JWT (firma JWKS, vigencia, emisor, audiencia, roles) y expone APIs agregadas hacia el frontend. |
 | **Movie Service**| `movie-service/`| Java 21, Spring Boot 3.3, Spring Data JPA | `8082` | Gestión de `Pelicula` y `Funcion`. Guarda portadas en disco local (volumen Docker `movie-uploads`, servidas en `/uploads/**`). Control de concurrencia pesimista en cupos. |
-| **Ticket Service**| `ticket-service/`| Java 21, Spring Boot 3.3, Spring Data JPA | `8083` | Orquestador del flujo de compra: valida stock en tiempo real con Movie Service, procesa pago simulado (`Pago`), emite `Ticket`, descuenta stock y retorna **HTTP 409 Conflict** si no hay cupos. Publica eventos `TICKET_PAGADO`/`TICKET_DEVUELTO` en RabbitMQ. |
-| **Notification Service**| `notification-service/`| Java 21, Spring Boot 3.3, **Spring AMQP (RabbitMQ)**, Spring Data JPA | `8084` | Consume eventos asincrónicos (`PELICULA_CREADA`, `TICKET_PAGADO`, `TICKET_DEVUELTO`), resuelve destinatarios según **reglas de distribución** administrables y persiste **notificaciones independientes por usuario**. Expone la API interna (BFF) y la de administración (destinos/reglas/mensajes fallidos). Dead-Letter Queue con `MensajeFallido`. |
+| **Ticket Service**| `ticket-service/`| Java 21, Spring Boot 3.3, Spring Data JPA | `8083` | Orquestador del flujo de compra: valida stock en tiempo real con Movie Service, procesa pago simulado (`Pago`), emite `Ticket`, descuenta stock y retorna **HTTP 409 Conflict** si no hay cupos. Publica eventos `TICKET_PAGADO`/`TICKET_DEVUELTO` en el topic SNS `pasalapeli-events`. |
+| **Notification Service**| `notification-service/`| Java 21, Spring Boot 3.3, **Spring Cloud AWS SQS**, Spring Data JPA | `8084` | Consume eventos asincrónicos (`PELICULA_CREADA`, `TICKET_PAGADO`, `TICKET_DEVUELTO`) desde SQS, resuelve destinatarios según **reglas de distribución** administrables y persiste **notificaciones independientes por usuario**. Expone la API interna (BFF) y la de administración (destinos/reglas/mensajes fallidos). Dead-Letter Queue con `MensajeFallido` (poller cada 60 s). |
 | **Base de Datos**| `database/` | MySQL 8.0 (`pasalapeli_db`) | `3306` | Persistencia relacional de 9 tablas (`Usuario`, `Pelicula`, `Funcion`, `Ticket`, `Pago`, `Notificacion`, `DestinoNotificacion`, `ReglaDistribucion`, `MensajeFallido`). Script inicial: `database/init.sql`. Corre **nativo en EC2-BDD** (no es contenedor) y es accesible por JDBC desde EC2-APPS. |
-| **Mensajería**| `database/` (compose) | RabbitMQ 3.13 (management) | `5672` / `15672` | Broker asincrónico central (exchange topic `pasalapeli.events`) que desacopla productores (movie/ticket) de consumidores (notification). Corre como contenedor en **EC2-APPS**. |
+| **Mensajería**| AWS (managed) | SNS topic + SQS queue + DLQ | n/a | Topología asincrónica (`pasalapeli-events` → `pasalapeli-notificaciones` → `pasalapeli-notificaciones-dlq`) que desacopla productores (movie/ticket) de consumidor (notification). Creada por `database/scripts/setup-messaging.sh` (idempotente); acceso vía instance profile `LabInstanceProfile` (IMDS), sin claves estáticas. |
 
 ---
 
@@ -191,12 +192,12 @@ El modelo de datos es el siguiente:
 3. API Gateway se descartó a favor del reverse-proxy de Nginx (ver sección 9.10). Cualquier diagrama o texto que muestre API Gateway como componente operativo está desactualizado.
 4. Lo mismo aplica a patrones: NO se implementa Factory Method ni Circuit Breaker ni Retry. Se implementan sus equivalentes ligeros: lock pesimista, timeouts de RestTemplate, fallbacks locales y manejo central de excepciones.
 
-### Flujo 6: Notificaciones asincrónicas por usuario (RabbitMQ)
-1. **movie-service** publica `PELICULA_CREADA` al crear una película; **ticket-service** publica `TICKET_PAGADO` (al comprar) y `TICKET_DEVUELTO` (al devolver). El envío ocurre **después de confirmar la transacción** (`@TransactionalEventListener(AFTER_COMMIT)`) hacia el exchange *topic* `pasalapeli.events`; si el broker falla, no se rompe la operación de negocio (best-effort).
-2. **notification-service** consume de `pasalapeli.notificaciones.queue` (binding `pelicula.*` y `ticket.*`). El conversor JSON usa `TypePrecedence.INFERRED`, por lo que cada servicio deserializa según su propia clase (los productores y el consumidor **no comparten clases**).
+### Flujo 6: Notificaciones asincrónicas por usuario (AWS SNS/SQS)
+1. **movie-service** publica `PELICULA_CREADA` al crear una película; **ticket-service** publica `TICKET_PAGADO` (al comprar) y `TICKET_DEVUELTO` (al devolver). El envío ocurre **después de confirmar la transacción** (`@TransactionalEventListener(AFTER_COMMIT)`) hacia el topic SNS `pasalapeli-events`; si SNS falla, no se rompe la operación de negocio (best-effort).
+2. **notification-service** consume de la cola SQS `pasalapeli-notificaciones` (`@SqsListener`, `RawMessageDelivery=true`: el body es el JSON del evento y el atributo `tipo` viene del FilterPolicy de la suscripción).
 3. El consumidor resuelve los destinatarios según las **reglas de distribución** activas (fallback a destinatario por defecto si no hay reglas) y persiste **una notificación independiente por usuario** (`Notificacion`).
-4. La cola declara `x-dead-letter-exchange`/`x-dead-letter-routing-key`; agotados los reintentos (`max-attempts: 3`, `default-requeue-rejected: false`), el mensaje se deriva a la **DLQ** (`pasalapeli.notificaciones.dlq`) y se registra en `MensajeFallido`.
-5. El **BFF** resuelve el usuario autenticado y expone `/api/notificaciones` (bandeja, contador de no leídas, marcar leída/todas) y `/api/admin/{destinos,reglas,mensajes-fallidos}` (solo `ADMIN`).
+4. Si el procesamiento falla, SQS reintenta y deriva el mensaje a la **DLQ** (`pasalapeli-notificaciones-dlq`, redrive `maxReceiveCount=3`); el poller `DeadLetterConsumer` (cada 60 s) los registra en `MensajeFallido` y los borra de la cola.
+5. El **BFF** resuelve el usuario autenticado y expone `/api/notificaciones` (bandeja paginada, contador de no leídas, marcar leída/todas) y `/api/admin/{destinos,reglas,mensajes-fallidos}` (solo `ADMIN`).
 6. El **frontend** muestra una **campana en el navbar** con el **contador de no leídas**; al hacer clic abre la **bandeja** y permite marcar como leídas. El `AdminComponent` incluye la administración de destinos y reglas de distribución.
 
 ---
@@ -205,12 +206,13 @@ El modelo de datos es el siguiente:
 
 ### Base de Datos (`Github/database/`) — Repo orquestador `pasalapeli-database`
 - `init.sql`: Creación del esquema `pasalapeli_db`, tablas con llaves foráneas, índices y datos iniciales de prueba (usuarios, películas, funciones, tickets, pagos, y destinos/reglas de notificación).
-- `docker-compose.yml`: Stack backend para **EC2-APPS** (rabbitmq 5672/15672, bff 8080, movie 8082, ticket 8083, notification 8084) apuntando a una **BDD externa** via `SPRING_DATASOURCE_URL` (topología 3 EC2). **No** contiene los servicios `mysql` ni `frontend`.
+- `docker-compose.yml`: Stack backend para **EC2-APPS** (bff 8080, movie 8082, ticket 8083, notification 8084) apuntando a una **BDD externa** via `SPRING_DATASOURCE_URL` (topología 3 EC2); la mensajería usa AWS SNS/SQS (`SNS_TOPIC_ARN`, `SQS_QUEUE_URL`, `SQS_DLQ_URL`). **No** contiene los servicios `mysql`, `rabbitmq` ni `frontend`.
 - `docker-compose.web.yml`: Stack **EC2-WEB** con SOLO el frontend (nginx, puertos 80/443, certs montados desde `./certs`). Build args: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `APP_BASE_URL`, `EC2_APPS_HOST`.
-- `.env.example`: Plantilla de variables del stack (incluye `SPRING_DATASOURCE_URL` y `CORS_ALLOWED_ORIGINS` para BDD externa).
+- `.env.example`: Plantilla de variables del stack (incluye `SPRING_DATASOURCE_URL`, `CORS_ALLOWED_ORIGINS` y las variables SNS/SQS).
 - `.github/workflows/bootstrap.yml`: Setup desde cero de EC2-APPS (Docker, repos, `.env`, `docker compose up --build`).
 - `scripts/bootstrap-ec2.sh`: Script de bootstrap que genera el `.env` del stack.
 - `scripts/renew-certs.sh`: Renovación automática de certificados Let's Encrypt.
+- `scripts/setup-messaging.sh`: Crea topic SNS, cola SQS, DLQ y suscripción con FilterPolicy (idempotente).
 
 ### Movie Service (`Github/movie-service/`)
 - `pom.xml`: Dependencias Spring Web, Data JPA, MySQL Connector, Validation, Lombok.
@@ -228,9 +230,8 @@ El modelo de datos es el siguiente:
   - `service/FuncionService.java`: Programación de funciones, consulta de stock y descuento atómico.
   - `controller/PeliculaController.java` (`/api/movies`): Endpoints de películas y subida de archivos.
   - `controller/FuncionController.java` (`/api/funciones`): Endpoints de funciones y disponibilidad.
-  - `event/EventoNotificacion.java`: Evento genérico publicado a RabbitMQ (campos `tipo`, `usuarioId`, `peliculaId`, `tituloPelicula`, `codigoTicket`, `cantidad`, `monto`, `sala`).
-  - `messaging/NotificacionEventPublisher.java`: Publica eventos a RabbitMQ tras confirmar la transacción (`@TransactionalEventListener(AFTER_COMMIT)`, best-effort).
-  - `config/RabbitProducerConfig.java`: Declara el exchange topic `pasalapeli.events` y el conversor JSON.
+  - `event/EventoNotificacion.java`: Evento genérico publicado a AWS SNS (campos `tipo`, `usuarioId`, `peliculaId`, `tituloPelicula`, `codigoTicket`, `cantidad`, `monto`, `sala`).
+  - `messaging/NotificacionEventPublisher.java`: Publica eventos a AWS SNS (`SnsTemplate`) tras confirmar la transacción (`@TransactionalEventListener(AFTER_COMMIT)`, best-effort; atributo de mensaje `tipo`).
   - `exception/`: `ResourceNotFoundException.java`, `InsufficientTicketsException.java` (409 Conflict), `ErrorResponse.java`, `GlobalExceptionHandler.java`.
   - `test/MovieServiceApplicationTests.java`: Pruebas de contexto.
 
@@ -248,9 +249,8 @@ El modelo de datos es el siguiente:
   - `client/MovieServiceClient.java`: Cliente HTTP REST para consultar y descontar cupos en `movie-service`.
   - `service/TicketService.java`: Lógica de compra transaccional, simulación de pago, emisión de código y descuento de inventario.
   - `controller/TicketController.java` (`/api/tickets`): Endpoints `/comprar`, `/{id}`, `/codigo/{codigo}`, `/usuario/{usuarioId}`.
-  - `event/EventoNotificacion.java`: Evento genérico publicado a RabbitMQ (eventos `TICKET_PAGADO`/`TICKET_DEVUELTO`).
-  - `messaging/NotificacionEventPublisher.java`: Publica eventos a RabbitMQ tras confirmar la transacción.
-  - `config/RabbitProducerConfig.java`: Exchange topic `pasalapeli.events` + conversor JSON.
+  - `event/EventoNotificacion.java`: Evento genérico publicado a AWS SNS (eventos `TICKET_PAGADO`/`TICKET_DEVUELTO`).
+  - `messaging/NotificacionEventPublisher.java`: Publica eventos a AWS SNS (`SnsTemplate`) tras confirmar la transacción.
   - `exception/`: `ResourceNotFoundException.java`, `InsufficientTicketsException.java`, `ErrorResponse.java`, `GlobalExceptionHandler.java`.
   - `test/TicketServiceApplicationTests.java`: Pruebas de integración base.
 
@@ -280,15 +280,14 @@ El modelo de datos es el siguiente:
   - `GlobalExceptionHandler`: `@Slf4j` y logging de 4xx/5xx/genéricos para diagnóstico.
 
 ### Notification Service (`Github/notification-service/`)
-- `pom.xml`: Spring Web, Data JPA, MySQL Connector, Validation, Lombok y **Spring Boot Starter AMQP (RabbitMQ)**.
-- `src/main/resources/application.yml`: Puerto 8084, datasource, `spring.rabbitmq.*` (con reintentos y `default-requeue-rejected: false`) y topología `notificaciones.*`.
+- `pom.xml`: Spring Web, Data JPA, MySQL Connector, Validation, Lombok y **Spring Cloud AWS SQS starter**.
+- `src/main/resources/application.yml`: Puerto 8084, datasource, `spring.cloud.aws.*` (región/credenciales por defecto) y `app.sqs.*` (`queue-url`, `dlq-url`, `dlq-name`).
 - `.gitignore`, `Dockerfile`: Contenedor Java 21 Alpine (healthcheck `/actuator/health`).
 - `src/main/java/com/pasalapeli/notification/`:
-  - `NotificationServiceApplication.java`: Clase principal Spring Boot.
-  - `config/RabbitConfig.java`: Configuración **centralizada** de la topología (exchange topic, cola, DLX, DLQ, bindings) y conversor JSON con `TypePrecedence.INFERRED`.
+  - `NotificationServiceApplication.java`: Clase principal Spring Boot (`@EnableScheduling` para el poller DLQ).
   - `config/WebMvcConfig.java`: CORS.
-  - `messaging/NotificacionConsumer.java`: Consumidor principal (`@RabbitListener`); delega en la lógica de negocio.
-  - `messaging/DeadLetterConsumer.java`: Consumidor de la DLQ; registra `MensajeFallido`.
+  - `messaging/NotificacionConsumer.java`: Consumidor principal (`@SqsListener`); delega en la lógica de negocio.
+  - `messaging/DeadLetterConsumer.java`: Poller programado (60 s) de la DLQ con `SqsClient`; registra `MensajeFallido` y borra el mensaje.
   - `entity/`: `Notificacion.java`, `DestinoNotificacion.java`, `ReglaDistribucion.java`, `MensajeFallido.java`, `Usuario.java` (solo lectura).
   - `repository/`: `NotificacionRepository.java`, `DestinoNotificacionRepository.java`, `ReglaDistribucionRepository.java`, `MensajeFallidoRepository.java`, `UsuarioRepository.java`.
   - `dto/`: `EventoNotificacionDTO.java`, `NotificacionDTO.java`, `CountDTO.java`, `DestinoDTO.java`, `DestinoRequestDTO.java`, `ReglaDTO.java`, `ReglaRequestDTO.java`, `MensajeFallidoDTO.java`.
@@ -344,13 +343,13 @@ Para **desarrollo local**: levantar un MySQL (Docker o nativo), importar `databa
 - **Movie Service:** `http://localhost:8082`
 - **Ticket Service:** `http://localhost:8083`
 - **Notification Service:** `http://localhost:8084`
-- **RabbitMQ (management):** `http://localhost:15672` (Usuario: `pasalapeli`, Password: `pasalapeli123`)
 - **MySQL (local):** `localhost:3306` (Usuario: `root`, Password: `root`, DB: `pasalapeli_db`)
+- **AWS SNS/SQS:** requiere credenciales válidas (env / profile); sin ellas, ejecutar `database/scripts/setup-messaging.sh` en local no es posible y el publisher registra el error sin romper el negocio.
 
 ### Ejecución en Modo Local / Desarrollo:
 0. **Base de Datos (opcional con Docker):** `docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=pasalapeli_db mysql:8` y luego importar `database/init.sql`.
 1. **Base de Datos:** Importar `database/init.sql` en MySQL.
-1b. **RabbitMQ (mensajería):** `docker run -d -p 5672:5672 -p 15672:15672 -e RABBITMQ_DEFAULT_USER=pasalapeli -e RABBITMQ_DEFAULT_PASS=pasalapeli123 rabbitmq:3.13-management-alpine`.
+1b. **Mensajería (AWS SNS/SQS):** ejecutar `database/scripts/setup-messaging.sh` (requiere AWS CLI con credenciales) y exportar `SNS_TOPIC_ARN`, `SQS_QUEUE_URL`, `SQS_DLQ_URL`. En local sin AWS, el publisher falla de forma best-effort y el listener puede desactivarse con `spring.cloud.aws.sqs.listener.auto-startup=false`.
 2. **Movie Service:** `cd movie-service && mvn spring-boot:run`
 3. **Ticket Service:** `cd ticket-service && mvn spring-boot:run`
 4. **Notification Service:** `cd notification-service && mvn spring-boot:run`
@@ -397,7 +396,7 @@ Para **desarrollo local**: levantar un MySQL (Docker o nativo), importar `databa
 | `pasalapeli-bff-service` | `Github/bff-service/` | Imagen del BFF (Spring Boot 8080) |
 | `pasalapeli-movie-service` | `Github/movie-service/` | Imagen del Movie Service (Spring Boot 8082) |
 | `pasalapeli-ticket-service` | `Github/ticket-service/` | Imagen del Ticket Service (Spring Boot 8083) |
-| `pasalapeli-notification-service` | `Github/notification-service/` | Imagen del Notification Service (Spring Boot 8084, consumidor RabbitMQ) |
+| `pasalapeli-notification-service` | `Github/notification-service/` | Imagen del Notification Service (Spring Boot 8084, consumidor SQS) |
 
 ### 9.3 Layout en EC2 - TOPOLOGÍA 3 EC2 (actual)
 
@@ -409,7 +408,7 @@ EC2-APPS: /opt/pasalapeli/ con los CLONES de:
             pasalapeli-movie-service/
             pasalapeli-ticket-service/
             pasalapeli-notification-service/
-          docker compose up -d --build (rabbitmq/bff/movie/ticket/notification)
+          docker compose up -d --build (bff/movie/ticket/notification; mensajeria AWS SNS/SQS)
 EC2-WEB:  /opt/pasalapeli/ con:
             pasalapeli-database/  (docker-compose.web.yml + .env)
             pasalapeli-frontend/
@@ -459,7 +458,7 @@ Todos usan [`appleboy/ssh-action`](https://github.com/appleboy/ssh-action) con l
 | `AZURE_AUTH_ENABLED` | `false` |
 | `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_APP_ID_URI` | vacío |
 | `AZURE_AD_ISSUER_URI` / `AZURE_AD_JWK_SET_URI` | vacío |
-| `RABBITMQ_DEFAULT_USER` / `RABBITMQ_DEFAULT_PASS` | `pasalapeli` / `pasalapeli123` |
+| `AWS_REGION` / `SNS_TOPIC_ARN` / `SQS_QUEUE_URL` / `SQS_DLQ_URL` | `us-east-1` / vacío (salida de `setup-messaging.sh`, relay via GitHub Variables) |
 
 > **Portadas:** se guardan en disco local dentro de EC2-APPS (volumen Docker `movie-uploads`); no requieren secretos ni credenciales de nube.
 
@@ -520,7 +519,7 @@ requeridos en el código para esta topología:
 | EC2 | Rol | Servicios | Puertos abiertos (SG) |
 | :--- | :--- | :--- | :--- |
 | `EC2-BDD` | Base de datos | MySQL 8 nativo (o MariaDB), `init.sql` | 22 (tu IP), 3306 (solo IP de EC2-APPS) |
-| `EC2-APPS` | Backend | Docker + rabbitmq (5672/15672), bff (8080), movie (8082), ticket (8083), notification (8084) | 22 (tu IP), 8080 (solo IP de EC2-WEB) |
+| `EC2-APPS` | Backend | Docker + bff (8080), movie (8082), ticket (8083), notification (8084); mensajería AWS SNS/SQS via instance profile | 22 (tu IP), 8080 (solo IP de EC2-WEB) |
 | `EC2-WEB` | Frontend | nginx (Angular) + proxy `/api` → EC2-APPS:8080 | 22 (tu IP), 80/443 (público) |
 
 Cambios en repos:

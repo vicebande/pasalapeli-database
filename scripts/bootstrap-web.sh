@@ -29,14 +29,14 @@ sudo apt-get install -y ca-certificates curl git openssl
 
 if ! command -v docker >/dev/null 2>&1; then
   log "Instalando Docker Engine"
-  curl -fsSL https://get.docker.com | sudo sh
+  curl --proto '=https' --proto-redir '=https' -fsSL https://get.docker.com | sudo sh
 fi
 sudo systemctl enable --now docker
 sudo usermod -aG docker "$(whoami)"
 
 log "Instalando plugin docker compose"
 sudo mkdir -p /usr/local/lib/docker/cli-plugins
-if [ ! -x /usr/local/lib/docker/cli-plugins/docker-compose ]; then
+if [[ ! -x /usr/local/lib/docker/cli-plugins/docker-compose ]]; then
   sudo curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" \
     -o /usr/local/lib/docker/cli-plugins/docker-compose
   sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
@@ -48,9 +48,9 @@ sudo mkdir -p "$APP_DIR"
 sudo chown -R "$(whoami)" "$APP_DIR"
 
 log "Clonando/actualizando repositorios (database + frontend)"
-if [ -n "$REPO_OWNER" ]; then
+if [[ -n "$REPO_OWNER" ]]; then
   for repo in pasalapeli-database pasalapeli-frontend; do
-    if [ -d "$APP_DIR/$repo/.git" ]; then
+    if [[ -d "$APP_DIR/$repo/.git" ]]; then
       (cd "$APP_DIR/$repo" && git pull --ff-only origin main)
     else
       git clone "https://github.com/$REPO_OWNER/$repo.git" "$APP_DIR/$repo"
@@ -62,8 +62,8 @@ CERT_DIR="$APP_DIR/pasalapeli-database/certs"
 mkdir -p "$CERT_DIR"
 
 log "Generando certificado HTTPS"
-if [ ! -s "$CERT_DIR/fullchain.pem" ]; then
-  if [ -n "$DOMAIN" ] && [ -n "$CERTBOT_EMAIL" ]; then
+if [[ ! -s "$CERT_DIR/fullchain.pem" ]]; then
+  if [[ -n "$DOMAIN" && -n "$CERTBOT_EMAIL" ]]; then
     log "Opcion Let's Encrypt para $DOMAIN (se ejecuta ANTES de levantar el contenedor)"
     sudo apt-get install -y certbot
     sudo certbot certonly --standalone --non-interactive --agree-tos \

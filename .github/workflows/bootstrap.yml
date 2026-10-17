@@ -11,8 +11,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  quality:
+    name: Quality Gate (SonarQube Cloud)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Analizar y esperar al Quality Gate (bloquea el bootstrap/deploy)
+        uses: SonarSource/sonarqube-scan-action@v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: -Dsonar.qualitygate.wait=true
+
   bootstrap:
     name: Setup EC2 y despliegue completo
+    needs: quality
     runs-on: ubuntu-latest
     steps:
       - name: Ejecutar bootstrap en el EC2
@@ -29,8 +45,10 @@ jobs:
           AZURE_AD_JWK_SET_URI: ${{ secrets.AZURE_AD_JWK_SET_URI || '' }}
           SPRING_DATASOURCE_URL: ${{ secrets.SPRING_DATASOURCE_URL || '' }}
           CORS_ALLOWED_ORIGINS: ${{ secrets.CORS_ALLOWED_ORIGINS || '*' }}
-          RABBITMQ_DEFAULT_USER: ${{ secrets.RABBITMQ_DEFAULT_USER || 'pasalapeli' }}
-          RABBITMQ_DEFAULT_PASS: ${{ secrets.RABBITMQ_DEFAULT_PASS || 'pasalapeli123' }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+          SNS_TOPIC_ARN: ${{ vars.SNS_TOPIC_ARN || '' }}
+          SQS_QUEUE_URL: ${{ vars.SQS_QUEUE_URL || '' }}
+          SQS_DLQ_URL: ${{ vars.SQS_DLQ_URL || '' }}
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -38,7 +56,7 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           command_timeout: 60m
           # Variables reenviadas al EC2 (definidas como env de este step)
-          envs: MYSQL_ROOT_PASSWORD,SPRING_DATASOURCE_USERNAME,SPRING_DATASOURCE_PASSWORD,AZURE_AUTH_ENABLED,AZURE_CLIENT_ID,AZURE_TENANT_ID,AZURE_APP_ID_URI,AZURE_AD_ISSUER_URI,AZURE_AD_JWK_SET_URI,SPRING_DATASOURCE_URL,CORS_ALLOWED_ORIGINS,RABBITMQ_DEFAULT_USER,RABBITMQ_DEFAULT_PASS
+          envs: MYSQL_ROOT_PASSWORD,SPRING_DATASOURCE_USERNAME,SPRING_DATASOURCE_PASSWORD,AZURE_AUTH_ENABLED,AZURE_CLIENT_ID,AZURE_TENANT_ID,AZURE_APP_ID_URI,AZURE_AD_ISSUER_URI,AZURE_AD_JWK_SET_URI,SPRING_DATASOURCE_URL,CORS_ALLOWED_ORIGINS,AWS_REGION,SNS_TOPIC_ARN,SQS_QUEUE_URL,SQS_DLQ_URL
           script: |
             set -euo pipefail
 
@@ -62,6 +80,7 @@ jobs:
             fi
             # Exportar para que bootstrap-ec2.sh (subproceso) las reciba
             export APP_BASE_URL CERTBOT_EMAIL CORS_ALLOWED_ORIGINS DOMAIN REPO_OWNER SPRING_DATASOURCE_URL
+            export AWS_REGION SNS_TOPIC_ARN SQS_QUEUE_URL SQS_DLQ_URL
 
             if [ -d /opt/pasalapeli/pasalapeli-database/.git ]; then
               cd /opt/pasalapeli/pasalapeli-database

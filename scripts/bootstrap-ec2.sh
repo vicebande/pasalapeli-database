@@ -10,6 +10,8 @@
 #   AZURE_AD_ISSUER_URI, AZURE_AD_JWK_SET_URI
 #   SPRING_DATASOURCE_URL  (URL de la BDD externa EC2-BDD) opcional
 #   CORS_ALLOWED_ORIGINS   (origen permitido del frontend, ej. https://peli.midominio.cl)
+#   SNS_TOPIC_ARN, SQS_QUEUE_URL, SQS_DLQ_URL (salida de scripts/setup-messaging.sh)
+#   AWS_REGION             (por defecto us-east-1)
 #   DOMAIN            (dominio publico, ej. peli.midominio.cl) opcional
 #   CERTBOT_EMAIL     (email para Let's Encrypt) opcional
 #   FORCE_ENV         (true para sobrescribir .env existente) opcional
@@ -37,7 +39,7 @@ sudo systemctl disable nginx 2>/dev/null || true
 
 if ! command -v docker >/dev/null 2>&1; then
   log "Instalando Docker Engine"
-  curl -fsSL https://get.docker.com | sudo sh
+  curl --proto '=https' --proto-redir '=https' -fsSL https://get.docker.com | sudo sh
 fi
 sudo systemctl enable --now docker
 sudo usermod -aG docker "$(whoami)"
@@ -88,9 +90,11 @@ AZURE_AD_JWK_SET_URI=${AZURE_AD_JWK_SET_URI:-https://login.microsoftonline.com/c
 APP_BASE_URL=${APP_BASE_URL:-https://localhost}
 CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-*}
 
-# --- Mensajeria asincrona (RabbitMQ en EC2-APPS) ---
-RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER:-pasalapeli}
-RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS:-pasalapeli123}
+# --- Mensajeria asincrona (AWS SNS/SQS; provista por scripts/setup-messaging.sh) ---
+AWS_REGION=${AWS_REGION:-us-east-1}
+SNS_TOPIC_ARN=${SNS_TOPIC_ARN:-}
+SQS_QUEUE_URL=${SQS_QUEUE_URL:-}
+SQS_DLQ_URL=${SQS_DLQ_URL:-}
 EOF
   chmod 600 "$ENV_FILE"
 fi
@@ -124,6 +128,8 @@ fi
 
 log "Limpiando contenedores previos/huerfanos (evita conflictos de nombre con stacks antiguos)"
 docker ps -aq --filter "name=pasalapeli" | xargs -r docker rm -f
+# Limpieza explicita del contenedor RabbitMQ de versiones anteriores (ya no se usa)
+docker rm -f pasalapeli-rabbitmq 2>/dev/null || true
 
 log "Levantando el stack completo"
 cd "$APP_DIR/pasalapeli-database"
@@ -133,7 +139,7 @@ log "Estado de los contenedores:"
 docker compose ps
 
 log "Esperando healthcheck de los servicios (hasta 180s)"
-SERVICES=(pasalapeli-rabbitmq pasalapeli-bff pasalapeli-movie pasalapeli-ticket pasalapeli-notification)
+SERVICES=(pasalapeli-bff pasalapeli-movie pasalapeli-ticket pasalapeli-notification)
 ALL_HEALTHY=0
 for i in $(seq 1 36); do
   ALL_HEALTHY=1
@@ -149,8 +155,9 @@ for i in $(seq 1 36); do
 done
 if [ "$ALL_HEALTHY" != "1" ]; then
   log "ERROR: los servicios no quedaron healthy tras 180s."
-  log "Revise la conectividad a MySQL (<IP_BDD>:3306) y el secret SPRING_DATASOURCE_URL."
-  docker compose logs --tail=50 rabbitmq bff-service movie-service ticket-service notification-service || true
+  log "Revise la conectividad a MySQL (<IP_BDD>:3306), el secret SPRING_DATASOURCE_URL"
+  log "y las variables SNS_TOPIC_ARN/SQS_QUEUE_URL (ejecutar scripts/setup-messaging.sh)."
+  docker compose logs --tail=50 bff-service movie-service ticket-service notification-service || true
   exit 1
 fi
 

@@ -46,10 +46,12 @@ CREATE TABLE IF NOT EXISTS `Funcion` (
   `hora` TIME NOT NULL,
   `sala` VARCHAR(50) NOT NULL,
   `entradas_disponibles` INT NOT NULL DEFAULT 0,
+  `aforo` INT NOT NULL DEFAULT 0 COMMENT 'Tope maximo de entradas vendibles de la sala (0 = sin tope)',
   `precio` DECIMAL(10,2) NOT NULL,
   `pelicula_id` BIGINT NOT NULL,
   PRIMARY KEY (`id`),
   INDEX `idx_funcion_pelicula` (`pelicula_id`),
+  UNIQUE KEY `uq_funcion_sala_fecha_hora` (`sala`, `fecha`, `hora`),
   CONSTRAINT `fk_funcion_pelicula`
     FOREIGN KEY (`pelicula_id`) REFERENCES `Pelicula` (`id`)
     ON DELETE CASCADE
@@ -68,9 +70,11 @@ CREATE TABLE IF NOT EXISTS `Ticket` (
   `usuario_id` BIGINT NOT NULL,
   `funcion_id` BIGINT NOT NULL,
   `cantidad` INT NOT NULL DEFAULT 1,
+  `idempotency_key` VARCHAR(64) NULL COMMENT 'Clave opcional de reintentos seguros (header Idempotency-Key)',
   PRIMARY KEY (`id`),
   INDEX `idx_ticket_usuario` (`usuario_id`),
   INDEX `idx_ticket_funcion` (`funcion_id`),
+  UNIQUE KEY `uq_ticket_usuario_funcion_idem` (`usuario_id`, `funcion_id`, `idempotency_key`),
   CONSTRAINT `fk_ticket_usuario`
     FOREIGN KEY (`usuario_id`) REFERENCES `Usuario` (`id`)
     ON DELETE RESTRICT
@@ -118,6 +122,7 @@ CREATE TABLE IF NOT EXISTS `Notificacion` (
   PRIMARY KEY (`id`),
   INDEX `idx_notificacion_usuario` (`usuario_id`),
   INDEX `idx_notificacion_usuario_leida` (`usuario_id`, `leida`),
+  UNIQUE KEY `uq_notificacion_usuario_tipo_ref` (`usuario_id`, `tipo`, `referencia`),
   CONSTRAINT `fk_notificacion_usuario`
     FOREIGN KEY (`usuario_id`) REFERENCES `Usuario` (`id`)
     ON DELETE CASCADE
@@ -191,16 +196,16 @@ INSERT INTO `Pelicula` (`id`, `titulo`, `descripcion`, `genero`, `duracion`, `cl
 (4, 'Oppenheimer', 'La historia del cientifico estadounidense J. Robert Oppenheimer y su rol en el desarrollo de la bomba atomica durante la Segunda Guerra Mundial.', 'Drama / Historica', 180, 'TE+14', 'https://images.unsplash.com/photo-1440404653325-ab127d49abc1?w=600&auto=format&fit=crop&q=80'),
 (5, 'Dune: Parte Dos', 'Paul Atreides se une a Chani y a los Fremen mientras busca venganza contra los conspiradores que destruyeron a su familia.', 'Ciencia Ficcion / Aventura', 166, 'TE+14', 'https://images.unsplash.com/photo-1534447677768-be436bb09401?w=600&auto=format&fit=crop&q=80');
 
-INSERT INTO `Funcion` (`id`, `fecha`, `hora`, `sala`, `entradas_disponibles`, `precio`, `pelicula_id`) VALUES
-(1, CURRENT_DATE(), '16:00:00', 'Sala 1 - IMAX', 45, 5500.00, 1),
-(2, CURRENT_DATE(), '19:30:00', 'Sala 1 - IMAX', 50, 5500.00, 1),
-(3, CURRENT_DATE(), '17:15:00', 'Sala 2 - 3D', 30, 4800.00, 2),
-(4, CURRENT_DATE(), '20:45:00', 'Sala 2 - 3D', 40, 4800.00, 2),
-(5, CURRENT_DATE(), '18:00:00', 'Sala 3 - 2D', 60, 4200.00, 3),
-(6, CURRENT_DATE(), '21:30:00', 'Sala 3 - 2D', 1, 4200.00, 3),
-(7, DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY), '15:00:00', 'Sala 4 - 2D', 50, 4200.00, 4),
-(8, DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY), '18:30:00', 'Sala 4 - 2D', 50, 4200.00, 4),
-(9, DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY), '20:00:00', 'Sala 1 - IMAX', 55, 5500.00, 5);
+INSERT INTO `Funcion` (`id`, `fecha`, `hora`, `sala`, `entradas_disponibles`, `aforo`, `precio`, `pelicula_id`) VALUES
+(1, CURRENT_DATE(), '16:00:00', 'Sala 1 - IMAX', 45, 45, 5500.00, 1),
+(2, CURRENT_DATE(), '19:30:00', 'Sala 1 - IMAX', 50, 50, 5500.00, 1),
+(3, CURRENT_DATE(), '17:15:00', 'Sala 2 - 3D', 30, 30, 4800.00, 2),
+(4, CURRENT_DATE(), '20:45:00', 'Sala 2 - 3D', 40, 40, 4800.00, 2),
+(5, CURRENT_DATE(), '18:00:00', 'Sala 3 - 2D', 60, 60, 4200.00, 3),
+(6, CURRENT_DATE(), '21:30:00', 'Sala 3 - 2D', 1, 1, 4200.00, 3),
+(7, DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY), '15:00:00', 'Sala 4 - 2D', 50, 50, 4200.00, 4),
+(8, DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY), '18:30:00', 'Sala 4 - 2D', 50, 50, 4200.00, 4),
+(9, DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY), '20:00:00', 'Sala 1 - IMAX', 55, 55, 5500.00, 5);
 
 INSERT INTO `Ticket` (`id`, `fecha_compra`, `codigo`, `estado`, `usuario_id`, `funcion_id`, `cantidad`) VALUES
 (1, DATE_SUB(NOW(), INTERVAL 2 HOUR), 'PLP-2026-0001', 'PAGADO', 2, 1, 1),

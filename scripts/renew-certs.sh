@@ -12,7 +12,7 @@ MODE="${1:-renew}"
 DOMAIN="${2:-}"
 APP_DIR="${3:-/opt/pasalapeli}"
 
-if [ "$MODE" = "install-cron" ]; then
+if [[ "$MODE" = "install-cron" ]]; then
   echo "==> Instalando cron de renovacion para $DOMAIN"
   CRON_LINE="15 3 * * * $APP_DIR/pasalapeli-database/scripts/renew-certs.sh renew $DOMAIN $APP_DIR >> /var/log/certbot-renew.log 2>&1"
   ( crontab -l 2>/dev/null | grep -v "renew-certs.sh" || true; echo "$CRON_LINE" ) | crontab -
@@ -20,7 +20,7 @@ if [ "$MODE" = "install-cron" ]; then
   exit 0
 fi
 
-if [ -z "$DOMAIN" ]; then
+if [[ -z "$DOMAIN" ]]; then
   echo "ERROR: DOMAIN requerido" >&2
   exit 1
 fi
@@ -30,7 +30,7 @@ CERT_DIR="$APP_DIR/certs"
 
 # Topologia 3 EC2: el frontend vive en docker-compose.web.yml (EC2-WEB).
 # Fallback a docker-compose.yml (frontend aun en el compose) para single-EC2.
-if [ -f "$COMPOSE_DIR/docker-compose.web.yml" ]; then
+if [[ -f "$COMPOSE_DIR/docker-compose.web.yml" ]]; then
   COMPOSE_FILE="docker-compose.web.yml"
 else
   COMPOSE_FILE="docker-compose.yml"
@@ -45,7 +45,7 @@ sudo certbot renew --cert-name "$DOMAIN" --standalone --non-interactive
 RENEW_RC=$?
 set -e
 # certbot devuelve 1 cuando el certificado no vence aun; no es un error fatal.
-if [ "$RENEW_RC" -ne 0 ] && [ "$RENEW_RC" -ne 1 ]; then
+if [[ "$RENEW_RC" -ne 0 && "$RENEW_RC" -ne 1 ]]; then
   echo "ERROR: certbot renew fallo (rc=$RENEW_RC)" >&2
 fi
 

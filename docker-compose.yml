@@ -1,27 +1,6 @@
 name: pasalapeli
 
 services:
-  rabbitmq:
-    container_name: pasalapeli-rabbitmq
-    image: rabbitmq:3.13-management-alpine
-    restart: unless-stopped
-    environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-pasalapeli}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-pasalapeli123}
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    volumes:
-      - rabbitmq-data:/var/lib/rabbitmq
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 20s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    networks:
-      - pasalapeli-net
-
   movie-service:
     container_name: pasalapeli-movie
     restart: unless-stopped
@@ -30,18 +9,14 @@ services:
     ports:
       - "8082:8082"
     environment:
-      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:-jdbc:mysql://<IP_BDD>:3306/pasalapeli_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:?Definir SPRING_DATASOURCE_URL en .env}
       SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-pasalapeli}
       SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-pasalapeli123}
-      SPRING_RABBITMQ_HOST: rabbitmq
-      SPRING_RABBITMQ_PORT: 5672
-      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_DEFAULT_USER:-pasalapeli}
-      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pasalapeli123}
+      # Mensajeria asincrona (AWS SNS); credenciales via IMDS/LabRole
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      SNS_TOPIC_ARN: ${SNS_TOPIC_ARN:-}
     volumes:
       - movie-uploads:/app/uploads
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
     networks:
       - pasalapeli-net
 
@@ -51,19 +26,16 @@ services:
     build:
       context: ../pasalapeli-ticket-service
     environment:
-      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:-jdbc:mysql://<IP_BDD>:3306/pasalapeli_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:?Definir SPRING_DATASOURCE_URL en .env}
       SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-pasalapeli}
       SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-pasalapeli123}
       MOVIE_SERVICE_URL: http://movie-service:8082
-      SPRING_RABBITMQ_HOST: rabbitmq
-      SPRING_RABBITMQ_PORT: 5672
-      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_DEFAULT_USER:-pasalapeli}
-      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pasalapeli123}
+      # Mensajeria asincrona (AWS SNS); credenciales via IMDS/LabRole
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      SNS_TOPIC_ARN: ${SNS_TOPIC_ARN:-}
     depends_on:
       movie-service:
         condition: service_started
-      rabbitmq:
-        condition: service_healthy
     networks:
       - pasalapeli-net
 
@@ -75,16 +47,14 @@ services:
     ports:
       - "8084:8084"
     environment:
-      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:-jdbc:mysql://<IP_BDD>:3306/pasalapeli_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:?Definir SPRING_DATASOURCE_URL en .env}
       SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-pasalapeli}
       SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-pasalapeli123}
-      SPRING_RABBITMQ_HOST: rabbitmq
-      SPRING_RABBITMQ_PORT: 5672
-      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_DEFAULT_USER:-pasalapeli}
-      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pasalapeli123}
+      # Consumo asincrono (AWS SQS + DLQ); credenciales via IMDS/LabRole
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      SQS_QUEUE_URL: ${SQS_QUEUE_URL:-}
+      SQS_DLQ_URL: ${SQS_DLQ_URL:-}
     depends_on:
-      rabbitmq:
-        condition: service_healthy
       movie-service:
         condition: service_started
       ticket-service:
@@ -122,7 +92,6 @@ services:
 
 volumes:
   movie-uploads:
-  rabbitmq-data:
 
 networks:
   pasalapeli-net:
