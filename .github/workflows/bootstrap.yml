@@ -84,7 +84,8 @@ jobs:
 
             if [ -d /opt/pasalapeli/pasalapeli-database/.git ]; then
               cd /opt/pasalapeli/pasalapeli-database
-              git pull --ff-only origin main
+              git fetch --prune origin
+              git reset --hard origin/main
             else
               sudo mkdir -p /opt/pasalapeli
               sudo chown "$(whoami)" /opt/pasalapeli

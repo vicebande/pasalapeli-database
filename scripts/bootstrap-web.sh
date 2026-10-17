@@ -51,7 +51,7 @@ log "Clonando/actualizando repositorios (database + frontend)"
 if [[ -n "$REPO_OWNER" ]]; then
   for repo in pasalapeli-database pasalapeli-frontend; do
     if [[ -d "$APP_DIR/$repo/.git" ]]; then
-      (cd "$APP_DIR/$repo" && git pull --ff-only origin main)
+      (cd "$APP_DIR/$repo" && git fetch --prune origin && git reset --hard origin/main)
     else
       git clone "https://github.com/$REPO_OWNER/$repo.git" "$APP_DIR/$repo"
     fi
