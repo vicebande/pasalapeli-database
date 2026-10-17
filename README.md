@@ -5,7 +5,7 @@ Repositorio orquestador de **Pasa La Peli**. Contiene:
 - `docker-compose.yml` — stack backend para **EC2-APPS**: `movie`, `ticket`, `notification` y `bff` (mensajería vía AWS SNS/SQS)
 - `docker-compose.web.yml` — stack para **EC2-WEB**: solo el `frontend` (nginx + HTTPS)
 - `init.sql` — script de creación de la base de datos `pasalapeli_db` (9 tablas: Usuario, Pelicula, Funcion, Ticket, Pago, Notificacion, DestinoNotificacion, ReglaDistribucion, MensajeFallido) con datos de prueba
-- `migrations/002-parches.sql` — migración idempotente de los parches de auditoría (aforo, idempotency_key, UNIQUEs)
+- `migrations/002-parches.sql` — migración idempotente de los parches de auditoría (aforo, idempotency_key, UNIQUEs). `bootstrap-ec2.sh` la aplica automáticamente en cada bootstrap (antes de levantar el stack); también puede ejecutarse manualmente contra la BDD.
 - `scripts/bootstrap-ec2.sh` — setup completo de EC2 desde cero (Docker, repos, certificados, deploy)
 - `scripts/renew-certs.sh` — renovación automática de certificados Let's Encrypt
 - `scripts/setup-messaging.sh` — crea topic SNS, cola SQS, DLQ y suscripción con FilterPolicy (idempotente, solo requiere AWS CLI)

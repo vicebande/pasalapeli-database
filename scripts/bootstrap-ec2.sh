@@ -99,6 +99,23 @@ EOF
   chmod 600 "$ENV_FILE"
 fi
 
+# --- Migraciones SQL idempotentes (se ejecutan ANTES de tocar contenedores) ---
+MIG_SQL="$APP_DIR/pasalapeli-database/migrations/002-parches.sql"
+if [ -f "$MIG_SQL" ]; then
+  DB_URL=$(grep -E '^SPRING_DATASOURCE_URL=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
+  DB_USER=$(grep -E '^SPRING_DATASOURCE_USERNAME=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
+  DB_PASS=$(grep -E '^SPRING_DATASOURCE_PASSWORD=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
+  DB_HOST=$(printf '%s' "$DB_URL" | sed -E 's#^jdbc:mysql://([^:/?]+).*#\1#')
+  if [ -n "$DB_URL" ] && [ -n "$DB_HOST" ] && [ "$DB_HOST" != "$DB_URL" ]; then
+    log "Aplicando migraciones SQL idempotentes a $DB_HOST (usuario $DB_USER)"
+    docker run --rm -i -e "MYSQL_PWD=$DB_PASS" mysql:8 \
+      mysql -h"$DB_HOST" -u"$DB_USER" --default-character-set=utf8mb4 < "$MIG_SQL"
+    log "Migraciones SQL aplicadas OK."
+  else
+    log "AVISO: SPRING_DATASOURCE_URL no valida; se omite migracion 002."
+  fi
+fi
+
 if [ -n "$DOMAIN" ] && [ -n "$CERTBOT_EMAIL" ]; then
   log "Emitiendo certificado Let's Encrypt para $DOMAIN"
   if [ ! -s "$APP_DIR/certs/fullchain.pem" ]; then
