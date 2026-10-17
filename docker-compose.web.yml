@@ -1,0 +1,18 @@
+name: pasalapeli-web
+
+services:
+  frontend:
+    container_name: pasalapeli-frontend
+    restart: unless-stopped
+    build:
+      context: ../pasalapeli-frontend
+      args:
+        AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-00000000-0000-0000-0000-000000000000}
+        AZURE_TENANT_ID: ${AZURE_TENANT_ID:-common}
+        APP_BASE_URL: ${APP_BASE_URL:-https://peli.midominio.cl}
+        EC2_APPS_HOST: ${EC2_APPS_HOST:-bff-service}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./certs:/etc/nginx/certs:ro

@@ -1,0 +1,7 @@
+.git
+.env
+certs/
+scripts/
+.github/
+*.md
+.gitignore

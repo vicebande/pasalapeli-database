@@ -1,0 +1,129 @@
+name: pasalapeli
+
+services:
+  rabbitmq:
+    container_name: pasalapeli-rabbitmq
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-pasalapeli}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-pasalapeli123}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - pasalapeli-net
+
+  movie-service:
+    container_name: pasalapeli-movie
+    restart: unless-stopped
+    build:
+      context: ../pasalapeli-movie-service
+    ports:
+      - "8082:8082"
+    environment:
+      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:-jdbc:mysql://<IP_BDD>:3306/pasalapeli_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-pasalapeli}
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-pasalapeli123}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_DEFAULT_USER:-pasalapeli}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pasalapeli123}
+    volumes:
+      - movie-uploads:/app/uploads
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - pasalapeli-net
+
+  ticket-service:
+    container_name: pasalapeli-ticket
+    restart: unless-stopped
+    build:
+      context: ../pasalapeli-ticket-service
+    environment:
+      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:-jdbc:mysql://<IP_BDD>:3306/pasalapeli_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-pasalapeli}
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-pasalapeli123}
+      MOVIE_SERVICE_URL: http://movie-service:8082
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_DEFAULT_USER:-pasalapeli}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pasalapeli123}
+    depends_on:
+      movie-service:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - pasalapeli-net
+
+  notification-service:
+    container_name: pasalapeli-notification
+    restart: unless-stopped
+    build:
+      context: ../pasalapeli-notification-service
+    ports:
+      - "8084:8084"
+    environment:
+      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:-jdbc:mysql://<IP_BDD>:3306/pasalapeli_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-pasalapeli}
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-pasalapeli123}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_DEFAULT_USER:-pasalapeli}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pasalapeli123}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      movie-service:
+        condition: service_started
+      ticket-service:
+        condition: service_started
+    networks:
+      - pasalapeli-net
+
+  bff-service:
+    container_name: pasalapeli-bff
+    restart: unless-stopped
+    build:
+      context: ../pasalapeli-bff-service
+    environment:
+      AZURE_AUTH_ENABLED: ${AZURE_AUTH_ENABLED:-false}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-00000000-0000-0000-0000-000000000000}
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-common}
+      AZURE_APP_ID_URI: ${AZURE_APP_ID_URI:-api://00000000-0000-0000-0000-000000000000}
+      AZURE_AD_ISSUER_URI: ${AZURE_AD_ISSUER_URI:-https://login.microsoftonline.com/common/v2.0}
+      AZURE_AD_JWK_SET_URI: ${AZURE_AD_JWK_SET_URI:-https://login.microsoftonline.com/common/discovery/v2.0/keys}
+      MOVIE_SERVICE_URL: http://movie-service:8082
+      TICKET_SERVICE_URL: http://ticket-service:8083
+      NOTIFICATION_SERVICE_URL: http://notification-service:8084
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}
+    ports:
+      - "8080:8080"
+    depends_on:
+      movie-service:
+        condition: service_started
+      ticket-service:
+        condition: service_started
+      notification-service:
+        condition: service_started
+    networks:
+      - pasalapeli-net
+
+volumes:
+  movie-uploads:
+  rabbitmq-data:
+
+networks:
+  pasalapeli-net:
+    driver: bridge

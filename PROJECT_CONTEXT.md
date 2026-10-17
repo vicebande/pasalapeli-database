@@ -1,0 +1,910 @@
+# 🧠 DOCUMENTO DE CONTEXTO TÉCNICO Y ARQUITECTURA (AI & DEVELOPER CONTEXT)
+## PROYECTO: "PASA LA PELI" - PLATAFORMA CLOUD NATIVE DE CINE
+*Este archivo está diseñado para ser leído por agentes de Inteligencia Artificial (Antigravity, LLMs, Copilots) y desarrolladores humanos para comprender de forma inmediata el estado, arquitectura, componentes y decisiones de diseño del proyecto.*
+
+---
+
+## 1. INFORMACIÓN GENERAL DEL PROYECTO
+- **Nombre del Sistema:** Pasa La Peli
+- **Autores:** Vicente Banderas, Martin Vergara
+- **Ubicación del Código:** `D:\Pasa La Peli\Github\`
+
+---
+
+## 2. ARQUITECTURA GLOBAL Y MULTI-CLOUD
+
+La plataforma utiliza una arquitectura distribuida de microservicios sobre **Microsoft Azure** y **Amazon Web Services (AWS)**:
+
+```mermaid
+flowchart TD
+    User["Cliente / Navegador Web"] --> WEB["EC2-WEB: Nginx (HTTPS 80/443)\nFrontend Angular 18 (SPA)"]
+    WEB <--"Autenticación MSAL / OIDC (JWT)"--> AzureAD["Microsoft Azure AD (Entra ID)"]
+    WEB --"HTTPS + Bearer JWT (proxy /api)"--> BFF["EC2-APPS: BFF Service (Spring Boot :8080)"]
+
+    BFF --"Valida JWT: Firma JWKS, Issuer, Aud, Expiración, Roles/Scopes"--> BFF
+    BFF --"REST Películas / Funciones"--> MovieSvc["Movie Service (Spring Boot :8082)"]
+    BFF --"REST Compra Tickets"--> TicketSvc["Ticket Service (Spring Boot :8083)"]
+    BFF --"REST Notificaciones"--> NotifSvc["Notification Service (Spring Boot :8084)"]
+
+    TicketSvc --"Consulta Disponibilidad / Descuento (REST)"--> MovieSvc
+    MovieSvc --"Publica eventos de negocio (AMQP)"--> Rabbit["EC2-APPS: RabbitMQ (pasalapeli.events)"]
+    TicketSvc --"Publica eventos de negocio (AMQP)"--> Rabbit
+    Rabbit --"Consume eventos (fan-out por usuario)"--> NotifSvc
+    MovieSvc --"Persistencia Catálogo & Salas (JDBC :3306)"--> MySQL[("EC2-BDD: MySQL 8.0 (pasalapeli_db)")]
+    TicketSvc --"Persistencia Tickets & Pagos (JDBC :3306)"--> MySQL
+    NotifSvc --"Persistencia Notificaciones (JDBC :3306)"--> MySQL
+    MovieSvc --"Upload / Delete Portadas (multipart, disco local)"--> LocalStore[("Volumen Docker movie-uploads, /uploads/**")]
+```
+
+> **NOTA:** **No existe AWS API Gateway.** El entrypoint real de la API es el **BFF** detrás del **proxy `/api` de Nginx** (EC2-WEB → EC2-APPS:8080). Cualquier diagrama o texto que muestre API Gateway como componente operativo está desactualizado.
+
+---
+
+## 3. MAPEO DE MICROSERVICIOS Y PUERTOS
+
+| Componente | Carpeta | Tecnología | Puerto | Responsabilidad Principal |
+| :--- | :--- | :--- | :---: | :--- |
+| **Frontend** | `frontend/` | Angular 18, MSAL Browser/Angular | `4200` (dev) / `80/443` (prod, nginx en EC2-WEB) | Interfaz de usuario, cartelera, selección de horarios, modal de compra con manejo de HTTP 409, panel de administración con subida de archivos e integración MSAL. Se sirve estático por Nginx en **EC2-WEB**, con proxy `/api` → EC2-APPS:8080. |
+| **BFF Service** | `bff-service/` | Java 21, Spring Boot 3.3, Spring Security OAuth2 | `8080` | Valida técnicamente el JWT (firma JWKS, vigencia, emisor, audiencia, roles) y expone APIs agregadas hacia el frontend. |
+| **Movie Service**| `movie-service/`| Java 21, Spring Boot 3.3, Spring Data JPA | `8082` | Gestión de `Pelicula` y `Funcion`. Guarda portadas en disco local (volumen Docker `movie-uploads`, servidas en `/uploads/**`). Control de concurrencia pesimista en cupos. |
+| **Ticket Service**| `ticket-service/`| Java 21, Spring Boot 3.3, Spring Data JPA | `8083` | Orquestador del flujo de compra: valida stock en tiempo real con Movie Service, procesa pago simulado (`Pago`), emite `Ticket`, descuenta stock y retorna **HTTP 409 Conflict** si no hay cupos. Publica eventos `TICKET_PAGADO`/`TICKET_DEVUELTO` en RabbitMQ. |
+| **Notification Service**| `notification-service/`| Java 21, Spring Boot 3.3, **Spring AMQP (RabbitMQ)**, Spring Data JPA | `8084` | Consume eventos asincrónicos (`PELICULA_CREADA`, `TICKET_PAGADO`, `TICKET_DEVUELTO`), resuelve destinatarios según **reglas de distribución** administrables y persiste **notificaciones independientes por usuario**. Expone la API interna (BFF) y la de administración (destinos/reglas/mensajes fallidos). Dead-Letter Queue con `MensajeFallido`. |
+| **Base de Datos**| `database/` | MySQL 8.0 (`pasalapeli_db`) | `3306` | Persistencia relacional de 9 tablas (`Usuario`, `Pelicula`, `Funcion`, `Ticket`, `Pago`, `Notificacion`, `DestinoNotificacion`, `ReglaDistribucion`, `MensajeFallido`). Script inicial: `database/init.sql`. Corre **nativo en EC2-BDD** (no es contenedor) y es accesible por JDBC desde EC2-APPS. |
+| **Mensajería**| `database/` (compose) | RabbitMQ 3.13 (management) | `5672` / `15672` | Broker asincrónico central (exchange topic `pasalapeli.events`) que desacopla productores (movie/ticket) de consumidores (notification). Corre como contenedor en **EC2-APPS**. |
+
+---
+
+## 4. ESQUEMA DE BASE DE DATOS (`pasalapeli_db`)
+
+El modelo de datos es el siguiente:
+
+1. **`Usuario`**:
+   - `id`: BIGINT PK AUTO_INCREMENT
+   - `nombre`: VARCHAR(100)
+   - `correo`: VARCHAR(100) UNIQUE
+   - `password`: VARCHAR(255)
+   - `rol`: ENUM('ADMIN', 'CLIENTE')
+
+2. **`Pelicula`**:
+   - `id`: BIGINT PK AUTO_INCREMENT
+   - `titulo`: VARCHAR(100)
+   - `descripcion`: TEXT
+   - `genero`: VARCHAR(50)
+   - `duracion`: INT (minutos)
+   - `clasificacion`: VARCHAR(10)
+   - `imagen`: VARCHAR(255) (ruta relativa local, ej. `/uploads/<archivo>`)
+
+3. **`Funcion`**:
+   - `id`: BIGINT PK AUTO_INCREMENT
+   - `fecha`: DATE
+   - `hora`: TIME
+   - `sala`: VARCHAR(50)
+   - `entradas_disponibles`: INT
+   - `precio`: DECIMAL(10,2)
+   - `pelicula_id`: BIGINT FK -> `Pelicula(id)` (ON DELETE CASCADE)
+
+4. **`Ticket`**:
+   - `id`: BIGINT PK AUTO_INCREMENT
+   - `fecha_compra`: DATETIME
+   - `codigo`: VARCHAR(100) UNIQUE (ej. `PLP-2026-XXXX`)
+   - `estado`: ENUM('PENDIENTE', 'PAGADO', 'CANCELADO')
+   - `usuario_id`: BIGINT FK -> `Usuario(id)`
+   - `funcion_id`: BIGINT FK -> `Funcion(id)`
+   - `cantidad`: INT (entradas por ticket, DEFAULT 1)
+
+5. **`Pago`**:
+   - `id`: BIGINT PK AUTO_INCREMENT
+   - `monto`: DECIMAL(10,2)
+   - `metodo`: VARCHAR(30) (ej. 'WEBPAY', 'TARJETA_CREDITO')
+   - `estado`: ENUM('PENDIENTE', 'APROBADO', 'RECHAZADO')
+   - `fecha_pago`: DATETIME
+   - `ticket_id`: BIGINT FK -> `Ticket(id)` (ON DELETE CASCADE)
+
+6. **`Notificacion`** (módulo de mensajería asincrónica):
+   - `id`: BIGINT PK AUTO_INCREMENT
+   - `usuario_id`: BIGINT FK -> `Usuario(id)` (ON DELETE CASCADE)
+   - `tipo`: VARCHAR(40) (`PELICULA_CREADA`, `TICKET_PAGADO`, `TICKET_DEVUELTO`)
+   - `titulo`: VARCHAR(150)
+   - `mensaje`: VARCHAR(500)
+   - `referencia`: VARCHAR(100) (id de película o código de ticket)
+   - `leida`: TINYINT(1) DEFAULT 0
+   - `fecha_creacion`: DATETIME DEFAULT CURRENT_TIMESTAMP
+   - Índices: `(usuario_id)`, `(usuario_id, leida)`
+
+7. **`DestinoNotificacion`**:
+   - `id`: BIGINT PK AUTO_INCREMENT
+   - `nombre`: VARCHAR(100) UNIQUE
+   - `tipo`: VARCHAR(30) (`TODOS`, `ROL`, `USUARIO`, `USUARIO_EVENTO`)
+   - `valor`: VARCHAR(100) (rol o id de usuario, según tipo)
+   - `descripcion`: VARCHAR(255)
+   - `activo`: TINYINT(1) DEFAULT 1
+   - `fecha_creacion`: DATETIME
+
+8. **`ReglaDistribucion`**:
+   - `id`: BIGINT PK AUTO_INCREMENT
+   - `evento`: VARCHAR(50) (`PELICULA_CREADA`, `TICKET_PAGADO`, `TICKET_DEVUELTO`)
+   - `destino_id`: BIGINT FK -> `DestinoNotificacion(id)` (ON DELETE CASCADE)
+   - `activo`: TINYINT(1) DEFAULT 1
+   - `fecha_creacion`: DATETIME
+   - Índice: `(evento)`
+
+9. **`MensajeFallido`** (Dead-Letter Queue):
+   - `id`: BIGINT PK AUTO_INCREMENT
+   - `cola`: VARCHAR(120)
+   - `payload`: TEXT
+   - `error`: TEXT
+   - `intentos`: INT DEFAULT 1
+   - `fecha_creacion`: DATETIME
+
+---
+
+## 5. FLUJOS DE NEGOCIO CLAVE IMPLEMENTADOS
+
+### Flujo 1: Autenticación con Azure AD y Validación en BFF
+1. Angular utiliza la librería `@azure/msal-browser` y `@azure/msal-angular` para autenticar al usuario contra Microsoft Entra ID (Azure AD).
+2. Se obtiene un token JWT válido.
+3. El `MsalInterceptor` inyecta automáticamente la cabecera `Authorization: Bearer <JWT>` en las peticiones hacia el BFF (a través del proxy `/api` de Nginx en EC2-WEB).
+4. El **BFF** valida de forma estricta:
+   - **Issuer:** Verifica que el emisor sea el inquilino configurado (`azure.activedirectory.tenant-id`).
+   - **Audience:** La clase `AudienceValidator` valida que el `aud` del token coincida con el Client ID o App ID URI registrado.
+   - **Firma criptográfica:** Consulta el endpoint JWKS público de Microsoft (`/discovery/v2.0/keys`).
+   - **Vigencia:** Valida expiración y marcas temporales con `JwtTimestampValidator`.
+   - **Roles y Scopes:** La clase `JwtAuthConverter` extrae los claims `roles` o `scp` para asignar permisos `ROLE_ADMIN` o `ROLE_CLIENTE`.
+   - *Modo Desarrollo:* Se incluye `DevMockAuthFilter` que permite simular la identidad mediante cabeceras `X-Dev-User-Role` y `X-Dev-User-Email` cuando no se dispone de una suscripción activa de Azure AD.
+   - **La validación del JWT la hace EXCLUSIVAMENTE el BFF; Nginx (reverse-proxy) no valida tokens.**
+
+### Flujo 2: Compra y Validación de Tickets con HTTP 409
+1. El usuario selecciona una película y una función en Angular.
+2. Angular llama a `POST /api/tickets/comprar` enviando `usuarioId`, `funcionId`, `cantidad` y `metodoPago`.
+3. El **BFF** reenvía la petición al **Ticket Service**.
+4. El **Ticket Service** consulta a **Movie Service** (`GET /api/funciones/{id}/disponibilidad`).
+5. **Evaluación de Disponibilidad:**
+   - **Caso Positivo (Hay cupo):**
+     - Se descuenta el stock en Movie Service (`PUT /api/funciones/{id}/descontar`) usando bloqueo pesimista `SELECT ... FOR UPDATE`.
+     - Se crea el registro `Ticket` con código único y estado `PAGADO`.
+     - Se simula y almacena la transacción en la tabla `Pago` con estado `APROBADO`.
+     - Se retorna el ticket digital al cliente con HTTP 201 Created.
+   - **Caso Negativo (Sin cupo):**
+     - Se lanza `InsufficientTicketsException`.
+      - El `GlobalExceptionHandler` intercepta la excepción y retorna un código de error **HTTP 409 Conflict**.
+     - El frontend muestra una alerta visual destacando el conflicto 409 y ofreciendo recargar la cartelera.
+
+### Flujo 3: Carga de Portadas a Almacenamiento Local (en la misma EC2)
+1. El administrador accede a `/admin` en Angular.
+2. Completa el formulario de película y adjunta el archivo de imagen de la portada.
+3. Se envía mediante `multipart/form-data` al endpoint `/api/admin/movies` del BFF, el cual lo canaliza a Movie Service.
+4. `LocalStorageService` guarda la imagen en disco dentro de `storage.local.upload-dir` (default `./uploads/peliculas`), que en Docker es el volumen `movie-uploads` montado en `/app/uploads` del contenedor `movie-service`.
+5. El archivo se expone como recurso estático en `GET /uploads/<archivo>` (`WebMvcConfig.addResourceHandlers`); Nginx (EC2-WEB) proxya `/uploads/` hacia `movie-service:8082` para servirlo al navegador.
+6. La ruta devuelta (ej. `/uploads/<uuid>.jpg`) se almacena en el campo `imagen` de la tabla `Pelicula`.
+
+### Flujo 4: Checkout simulado con tarjeta y registro automático de usuario (11/09/2026)
+1. En la modal de compra, el usuario completa el paso "Detalle" (cantidad + método) y presiona **"Continuar al Pago"**.
+2. Se muestra un paso "Pago Simulado": tarjeta visual, campos de titular, número (16 dígitos formateados 4-4-4-4), vencimiento MM/AA y CVV. Validación client-side y aviso de que el pago es 100% simulado (puede usarse 4242 4242 4242 4242).
+3. **"Confirmar Pago y Emitir Ticket"** simula el procesamiento con el gateway (spinner 1.2 s) e invoca `POST /api/tickets/comprar` como antes (Ticket Service crea `Pago` con estado `APROBADO` automáticamente). No hay backend de pagos externo.
+4. **Identidad real del usuario:** en modo Azure, `AuthService.sincronizarPerfilConBFF()` consulta `GET /api/auth/me` del BFF tras el login; el BFF llama `POST /api/usuarios/ensure` en Ticket Service (find-or-create por correo en la tabla `Usuario`, rol `CLIENTE`) y devuelve el `id` real, reemplazando el antiguo `id: 2` fijo para todos.
+5. Fallback: si Ticket Service no responde, el BFF conserva el mapeo demo (ADMIN=1, resto=2).
+6. Fix adicional del build: `AuthService.login()` ya no hace spread sobre `msalGuardConfig.authRequest` (no era asignable a `RedirectRequest` — TypeScript exigía `scopes`); ahora pasa el `authRequest` tal cual (ya trae `scopes` desde `msal.config.ts`).
+
+### Flujo 5: Arquitectura real - SIN AWS API Gateway (11/09/2026)
+1. El punto de entrada de la API es el **BFF (Spring Boot :8080)** alojado en **EC2-APPS**.
+2. El **Nginx** del frontend (**EC2-WEB**) redirige las rutas `/api/*` a `http://<EC2_APPS_HOST>:8080` mediante `proxy_pass` (ver `frontend/nginx.conf`). **No existe AWS API Gateway** en el código, en Docker, ni en el despliegue.
+3. API Gateway se descartó a favor del reverse-proxy de Nginx (ver sección 9.10). Cualquier diagrama o texto que muestre API Gateway como componente operativo está desactualizado.
+4. Lo mismo aplica a patrones: NO se implementa Factory Method ni Circuit Breaker ni Retry. Se implementan sus equivalentes ligeros: lock pesimista, timeouts de RestTemplate, fallbacks locales y manejo central de excepciones.
+
+### Flujo 6: Notificaciones asincrónicas por usuario (RabbitMQ)
+1. **movie-service** publica `PELICULA_CREADA` al crear una película; **ticket-service** publica `TICKET_PAGADO` (al comprar) y `TICKET_DEVUELTO` (al devolver). El envío ocurre **después de confirmar la transacción** (`@TransactionalEventListener(AFTER_COMMIT)`) hacia el exchange *topic* `pasalapeli.events`; si el broker falla, no se rompe la operación de negocio (best-effort).
+2. **notification-service** consume de `pasalapeli.notificaciones.queue` (binding `pelicula.*` y `ticket.*`). El conversor JSON usa `TypePrecedence.INFERRED`, por lo que cada servicio deserializa según su propia clase (los productores y el consumidor **no comparten clases**).
+3. El consumidor resuelve los destinatarios según las **reglas de distribución** activas (fallback a destinatario por defecto si no hay reglas) y persiste **una notificación independiente por usuario** (`Notificacion`).
+4. La cola declara `x-dead-letter-exchange`/`x-dead-letter-routing-key`; agotados los reintentos (`max-attempts: 3`, `default-requeue-rejected: false`), el mensaje se deriva a la **DLQ** (`pasalapeli.notificaciones.dlq`) y se registra en `MensajeFallido`.
+5. El **BFF** resuelve el usuario autenticado y expone `/api/notificaciones` (bandeja, contador de no leídas, marcar leída/todas) y `/api/admin/{destinos,reglas,mensajes-fallidos}` (solo `ADMIN`).
+6. El **frontend** muestra una **campana en el navbar** con el **contador de no leídas**; al hacer clic abre la **bandeja** y permite marcar como leídas. El `AdminComponent` incluye la administración de destinos y reglas de distribución.
+
+---
+
+## 6. INVENTARIO COMPLETO DE ARCHIVOS CREADOS
+
+### Base de Datos (`Github/database/`) — Repo orquestador `pasalapeli-database`
+- `init.sql`: Creación del esquema `pasalapeli_db`, tablas con llaves foráneas, índices y datos iniciales de prueba (usuarios, películas, funciones, tickets, pagos, y destinos/reglas de notificación).
+- `docker-compose.yml`: Stack backend para **EC2-APPS** (rabbitmq 5672/15672, bff 8080, movie 8082, ticket 8083, notification 8084) apuntando a una **BDD externa** via `SPRING_DATASOURCE_URL` (topología 3 EC2). **No** contiene los servicios `mysql` ni `frontend`.
+- `docker-compose.web.yml`: Stack **EC2-WEB** con SOLO el frontend (nginx, puertos 80/443, certs montados desde `./certs`). Build args: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `APP_BASE_URL`, `EC2_APPS_HOST`.
+- `.env.example`: Plantilla de variables del stack (incluye `SPRING_DATASOURCE_URL` y `CORS_ALLOWED_ORIGINS` para BDD externa).
+- `.github/workflows/bootstrap.yml`: Setup desde cero de EC2-APPS (Docker, repos, `.env`, `docker compose up --build`).
+- `scripts/bootstrap-ec2.sh`: Script de bootstrap que genera el `.env` del stack.
+- `scripts/renew-certs.sh`: Renovación automática de certificados Let's Encrypt.
+
+### Movie Service (`Github/movie-service/`)
+- `pom.xml`: Dependencias Spring Web, Data JPA, MySQL Connector, Validation, Lombok.
+- `src/main/resources/application.yml`: Configuración de base de datos, puerto 8082 y `storage.local.upload-dir` para las portadas.
+- `.gitignore`: Ignora `target/`, carpetas de IDE y `uploads/`.
+- `Dockerfile`: Compilación y empaquetado contenedor multi-stage en Java 21 Alpine.
+- `src/main/java/com/pasalapeli/movie/`:
+  - `MovieServiceApplication.java`: Clase principal Spring Boot.
+  - `entity/Pelicula.java` & `entity/Funcion.java`: Entidades JPA mapeadas a las tablas MySQL.
+  - `dto/`: `PeliculaDTO.java`, `PeliculaRequestDTO.java`, `FuncionDTO.java`, `FuncionRequestDTO.java`, `DisponibilidadDTO.java`.
+  - `repository/PeliculaRepository.java` & `FuncionRepository.java`: Consultas JPQL y bloqueo pesimista `findByIdForUpdate`.
+  - `config/WebMvcConfig.java`: Configuración de CORS y mapeo estático de `/uploads/**` al `storage.local.upload-dir`.
+  - `service/LocalStorageService.java`: Guarda y elimina las portadas en disco local (`/uploads/<uuid><ext>`).
+  - `service/PeliculaService.java`: CRUD de películas y gestión de portadas.
+  - `service/FuncionService.java`: Programación de funciones, consulta de stock y descuento atómico.
+  - `controller/PeliculaController.java` (`/api/movies`): Endpoints de películas y subida de archivos.
+  - `controller/FuncionController.java` (`/api/funciones`): Endpoints de funciones y disponibilidad.
+  - `event/EventoNotificacion.java`: Evento genérico publicado a RabbitMQ (campos `tipo`, `usuarioId`, `peliculaId`, `tituloPelicula`, `codigoTicket`, `cantidad`, `monto`, `sala`).
+  - `messaging/NotificacionEventPublisher.java`: Publica eventos a RabbitMQ tras confirmar la transacción (`@TransactionalEventListener(AFTER_COMMIT)`, best-effort).
+  - `config/RabbitProducerConfig.java`: Declara el exchange topic `pasalapeli.events` y el conversor JSON.
+  - `exception/`: `ResourceNotFoundException.java`, `InsufficientTicketsException.java` (409 Conflict), `ErrorResponse.java`, `GlobalExceptionHandler.java`.
+  - `test/MovieServiceApplicationTests.java`: Pruebas de contexto.
+
+### Ticket Service (`Github/ticket-service/`)
+- `pom.xml`: Dependencias Spring Web, Data JPA, MySQL Connector, Validation, Lombok.
+- `src/main/resources/application.yml`: Configuración de base de datos, puerto 8083 y URL de `movie-service`.
+- `.gitignore`: Ignora compilados y artefactos.
+- `Dockerfile`: Contenedor Java 21 Alpine.
+- `src/main/java/com/pasalapeli/ticket/`:
+  - `TicketServiceApplication.java`: Clase principal Spring Boot.
+  - `entity/`: `Usuario.java`, `Ticket.java`, `Pago.java`, `EstadoTicket.java`, `EstadoPago.java`, `RolUsuario.java`.
+  - `dto/`: `ComprarTicketRequestDTO.java`, `TicketResponseDTO.java`, `PagoDTO.java`, `DisponibilidadResponseDTO.java`.
+  - `repository/`: `TicketRepository.java`, `PagoRepository.java`, `UsuarioRepository.java`.
+  - `config/RestClientConfig.java`: Configuración de `RestTemplate` con timeouts de red.
+  - `client/MovieServiceClient.java`: Cliente HTTP REST para consultar y descontar cupos en `movie-service`.
+  - `service/TicketService.java`: Lógica de compra transaccional, simulación de pago, emisión de código y descuento de inventario.
+  - `controller/TicketController.java` (`/api/tickets`): Endpoints `/comprar`, `/{id}`, `/codigo/{codigo}`, `/usuario/{usuarioId}`.
+  - `event/EventoNotificacion.java`: Evento genérico publicado a RabbitMQ (eventos `TICKET_PAGADO`/`TICKET_DEVUELTO`).
+  - `messaging/NotificacionEventPublisher.java`: Publica eventos a RabbitMQ tras confirmar la transacción.
+  - `config/RabbitProducerConfig.java`: Exchange topic `pasalapeli.events` + conversor JSON.
+  - `exception/`: `ResourceNotFoundException.java`, `InsufficientTicketsException.java`, `ErrorResponse.java`, `GlobalExceptionHandler.java`.
+  - `test/TicketServiceApplicationTests.java`: Pruebas de integración base.
+
+### BFF Service (`Github/bff-service/`)
+- `pom.xml`: Dependencias Spring Web, Spring Security, OAuth2 Resource Server, Validation, Lombok.
+- `src/main/resources/application.yml`: Puerto 8080, endpoints de Azure AD y downstream de microservicios.
+- `.gitignore`: Reglas de exclusión estándar.
+- `Dockerfile`: Contenedor Java 21 Alpine.
+- `src/main/java/com/pasalapeli/bff/`:
+  - `BffServiceApplication.java`: Punto de entrada del microservicio orquestador.
+  - `config/AudienceValidator.java`: Validador de claim `aud` para Azure AD.
+  - `config/JwtAuthConverter.java`: Mapeador de claims `roles` y `scp` a `GrantedAuthority`.
+  - `config/DevMockAuthFilter.java`: Filtro de soporte para testing y emulación de identidades.
+  - `config/SecurityConfig.java`: Configuración de `SecurityFilterChain`, `JwtDecoder` con Nimbus, rutas públicas y protegidas.
+  - `config/WebClientConfig.java`: Configuración de `RestTemplate` para llamadas proxy.
+  - `dto/UserProfileDTO.java`: DTO de perfil autenticado.
+  - `client/MovieClient.java`: Proxy de llamadas al catálogo de películas.
+  - `client/TicketClient.java`: Proxy de transacciones de compra de tickets.
+  - `controller/AuthController.java` (`/api/auth`): `/me` y `/login-info`.
+  - `controller/CarteleraBffController.java` (`/api/cartelera`): Catálogo público de películas y funciones.
+  - `controller/TicketBffController.java` (`/api/tickets`): Compra y consulta de tickets autenticados.
+  - `controller/AdminBffController.java` (`/api/admin`): Creación de películas, carga de portadas (disco local) y funciones bajo rol ADMIN.
+  - `client/NotificationClient.java`: Proxy de llamadas al Notification Service (bandeja, contador, marcar leídas y administración).
+  - `controller/NotificationBffController.java` (`/api/notificaciones`): Bandeja del usuario autenticado (lista, conteo no leídas, marcar leída/todas).
+  - `controller/AdminNotificacionBffController.java` (`/api/admin`): Destinos, reglas de distribución y mensajes fallidos (solo ADMIN).
+  - `exception/GlobalExceptionHandler.java`: Manejo centralizado de respuestas de error.
+  - `GlobalExceptionHandler`: `@Slf4j` y logging de 4xx/5xx/genéricos para diagnóstico.
+
+### Notification Service (`Github/notification-service/`)
+- `pom.xml`: Spring Web, Data JPA, MySQL Connector, Validation, Lombok y **Spring Boot Starter AMQP (RabbitMQ)**.
+- `src/main/resources/application.yml`: Puerto 8084, datasource, `spring.rabbitmq.*` (con reintentos y `default-requeue-rejected: false`) y topología `notificaciones.*`.
+- `.gitignore`, `Dockerfile`: Contenedor Java 21 Alpine (healthcheck `/actuator/health`).
+- `src/main/java/com/pasalapeli/notification/`:
+  - `NotificationServiceApplication.java`: Clase principal Spring Boot.
+  - `config/RabbitConfig.java`: Configuración **centralizada** de la topología (exchange topic, cola, DLX, DLQ, bindings) y conversor JSON con `TypePrecedence.INFERRED`.
+  - `config/WebMvcConfig.java`: CORS.
+  - `messaging/NotificacionConsumer.java`: Consumidor principal (`@RabbitListener`); delega en la lógica de negocio.
+  - `messaging/DeadLetterConsumer.java`: Consumidor de la DLQ; registra `MensajeFallido`.
+  - `entity/`: `Notificacion.java`, `DestinoNotificacion.java`, `ReglaDistribucion.java`, `MensajeFallido.java`, `Usuario.java` (solo lectura).
+  - `repository/`: `NotificacionRepository.java`, `DestinoNotificacionRepository.java`, `ReglaDistribucionRepository.java`, `MensajeFallidoRepository.java`, `UsuarioRepository.java`.
+  - `dto/`: `EventoNotificacionDTO.java`, `NotificacionDTO.java`, `CountDTO.java`, `DestinoDTO.java`, `DestinoRequestDTO.java`, `ReglaDTO.java`, `ReglaRequestDTO.java`, `MensajeFallidoDTO.java`.
+  - `service/`: `NotificacionService.java` (procesamiento del evento, resolución de destinatarios y CRUD de notificaciones), `DestinoService.java`, `ReglaService.java`, `MensajeFallidoService.java`.
+  - `controller/`: `NotificacionController.java` (`/api/notificaciones`), `AdminNotificacionController.java` (`/api/notificaciones/admin`).
+  - `exception/`: `ErrorResponse.java`, `ResourceNotFoundException.java`, `BusinessException.java`, `GlobalExceptionHandler.java`.
+
+### Frontend Angular (`Github/frontend/`)
+- `package.json`: Angular 18, `@azure/msal-browser`, `@azure/msal-angular`, TypeScript 5.5.
+- `angular.json`, `tsconfig.json`, `tsconfig.app.json`: Configuración de compilación moderna.
+- `.gitignore`: Ignora `node_modules/`, `dist/`, `.angular/cache/`.
+- `Dockerfile` & `nginx.conf`: Despliegue listo para producción con Nginx como servidor estático y reverse-proxy.
+- `src/index.html` & `src/styles.css`: Maquetación estética temática de cine oscuro con colores rojo carmesí, dorado y azul cian.
+- `src/environments/`: `environment.ts` y `environment.prod.ts` con parámetros para Azure AD y APIs.
+- `src/app/`:
+  - `services/msal.config.ts`: Factorías de configuración para `MSALInstance`, `MsalGuard` y `MsalInterceptor`.
+  - `services/auth.service.ts`: Servicio unificado de autenticación con soporte para Azure AD y switch local de roles Demo.
+  - `services/cartelera.service.ts`: Cliente de consumo de cartelera.
+  - `services/ticket.service.ts`: Cliente de compra de tickets.
+  - `services/admin.service.ts`: Cliente de administración y envío multipart de imágenes al almacenamiento local + administración de mensajería (destinos/reglas/mensajes fallidos).
+  - `services/notification.service.ts`: Cliente del buzón de notificaciones (bandeja, conteo de no leídas, marcar leída/todas).
+  - `models/notificacion.model.ts`: Tipos de `Notificacion`, `DestinoNotificacion`, `ReglaDistribucion` y `MensajeFallido`.
+  - `guards/auth.guard.ts` & `guards/admin.guard.ts`: Protección de rutas en el cliente.
+  - `components/navbar/`: Barra de navegación con logo, menú, campana de notificaciones, botón de Azure AD, badge de usuario y selector de roles demo.
+  - `components/notificaciones/`: Campana con **contador de no leídas** y **bandeja (inbox)** desplegable; marca leídas individual/todas.
+  - `components/cartelera/`: Vista principal de películas en cartelera con buscador en vivo y fichas de estreno.
+  - `components/pelicula-detalle/`: Vista detallada de película, horarios, salas y cupos en tiempo real.
+  - `components/compra-ticket/`: Modal reactivo de selección de entradas, cálculo de precio, simulación de pago, manejo visual de **HTTP 409 Conflict** y emisión de ticket digital con código de barras simulado.
+  - `components/mis-tickets/`: Historial de entradas compradas por el usuario autenticado.
+  - `components/admin/`: Panel de gestión con formulario de carga de portada (almacenamiento local) y programación de funciones en sala.
+  - `components/admin-mensajeria/`: Sección de administración de la mensajería (crear/eliminar destinos y reglas de distribución, ver mensajes fallidos).
+  - `app.component.*`, `app.routes.ts`, `app.config.ts`, `main.ts`: Estructura principal Standalone de Angular 18.
+
+### Nota sobre la estructura de repos (monorepo superado)
+Cada componente vive en su propio repo de GitHub (ver sección 9.2). La carpeta local `Github/` contiene los 6 working trees independientes:
+- `database/` (orquestador), `frontend/`, `bff-service/`, `movie-service/`, `ticket-service/`, `notification-service/`.
+- No existe un `docker-compose.yml` a nivel de `Github/`; los compose viven en `Github/database/` (`docker-compose.yml` para EC2-APPS y `docker-compose.web.yml` para EC2-WEB).
+
+---
+
+## 7. CÓMO EJECUTAR EL PROYECTO
+
+### Ejecución Todo-en-Uno (Docker Compose, topología 3 EC2):
+Los compose viven en `Github/database/` y referencian los repos hermanos como contexto de build (clonarlos como carpetas hermanas al clonar, o ajustar `build.context`). En EC2:
+
+- **EC2-APPS** (backend): `docker compose up -d --build` desde `Github/database/` con `.env` configurado (`SPRING_DATASOURCE_URL` → `jdbc:mysql://<IP_BDD>:3306/...`).
+- **EC2-WEB** (frontend): `docker compose -f docker-compose.web.yml up -d --build` desde `Github/database/` (puertos 80/443, certs en `Github/database/certs/`).
+
+Para **desarrollo local**: levantar un MySQL (Docker o nativo), importar `database/init.sql` y exportar `SPRING_DATASOURCE_URL` (apuntando a localhost) antes de `docker compose up`.
+
+- **Frontend:** `http://localhost:80`
+- **BFF:** `http://localhost:8080`
+- **Movie Service:** `http://localhost:8082`
+- **Ticket Service:** `http://localhost:8083`
+- **Notification Service:** `http://localhost:8084`
+- **RabbitMQ (management):** `http://localhost:15672` (Usuario: `pasalapeli`, Password: `pasalapeli123`)
+- **MySQL (local):** `localhost:3306` (Usuario: `root`, Password: `root`, DB: `pasalapeli_db`)
+
+### Ejecución en Modo Local / Desarrollo:
+0. **Base de Datos (opcional con Docker):** `docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=pasalapeli_db mysql:8` y luego importar `database/init.sql`.
+1. **Base de Datos:** Importar `database/init.sql` en MySQL.
+1b. **RabbitMQ (mensajería):** `docker run -d -p 5672:5672 -p 15672:15672 -e RABBITMQ_DEFAULT_USER=pasalapeli -e RABBITMQ_DEFAULT_PASS=pasalapeli123 rabbitmq:3.13-management-alpine`.
+2. **Movie Service:** `cd movie-service && mvn spring-boot:run`
+3. **Ticket Service:** `cd ticket-service && mvn spring-boot:run`
+4. **Notification Service:** `cd notification-service && mvn spring-boot:run`
+5. **BFF Service:** `cd bff-service && mvn spring-boot:run`
+6. **Frontend:** `cd frontend && npm install && npm start` -> Abrir `http://localhost:4200`
+
+---
+
+## 8. INSTRUCCIONES PARA AGENTES DE IA FUTUROS
+- Al agregar nuevas funcionalidades, **respeta los límites de dominio de cada microservicio**. No mezcles la lógica de pagos o tickets dentro de `movie-service`, ni la lógica de películas en `ticket-service`.
+- Mantén siempre el retorno explícito del código **HTTP 409 Conflict** en `ticket-service` y en el `GlobalExceptionHandler` cuando se intenten comprar más entradas de las disponibles.
+- Cuando habilites Azure AD en producción, actualiza los valores `enabled: true`, `clientId` y `tenantId` en `frontend/src/environments/environment.ts` y en `bff-service/src/main/resources/application.yml`.
+- R1: Prohibido presentar "AWS API Gateway" como componente implementado. El entrypoint real es el BFF tras Nginx.
+- R2: Prohibido presentar Factory Method / Circuit Breaker / Retry como implementados; etiquetarlos siempre como "ARQUITECTURA PROPUESTA".
+- R3: Si se modifica la arquitectura, actualizar SIEMPRE el presente `PROJECT_CONTEXT.md` en el maestro y en las 6 copias (incluida `notification-service/`).
+- R4: El campo de BD para la portada se llama `imagen`. Nunca usar `imagen_url`.
+- R5: El almacenamiento de portadas es 100% **local en disco** (volumen Docker `movie-uploads` en EC2-APPS, `LocalStorageService`). **No** usar Amazon S3 ni documentarlo como implementado; la única mención válida a S3 es histórica (sección 14).
+- Para cualquier duda o requerimiento técnico adicional, consulta este documento (`PROJECT_CONTEXT.md`).
+
+---
+
+## 9. PLAN DE CI/CD Y DESPLIEGUE A NUBE (ACUERDOS DE SESIÓN)
+
+> **Propósito:** Documentar las decisiones acordadas para que cualquier agente de IA o desarrollador retome el trabajo sin depender de conversaciones anteriores.
+
+### 9.1 Decisiones arquitectónicas de despliegue
+
+| Decisión | Valor acordado |
+| :--- | :--- |
+| Estructura de repos | **Monorepo descartado.** Cada componente es un **repo de GitHub independiente y público** |
+| Despliegue | **Directo a una instancia EC2 (Ubuntu 24.04) vía SSH desde GitHub Actions** |
+| Registro de imágenes | **Ninguno (no ECR/ACR).** Las imágenes se construyen en el propio EC2 (`git pull` + `docker compose up -d --build`) |
+| Orquestación en EC2 | Docker Compose en `/opt/pasalapeli/`; el repo `pasalapeli-database` actúa como **orquestador** (contiene `docker-compose.yml` + `.env`) |
+| Microsoft Azure AD | **Modo real en producción** (`AZURE_AUTH_ENABLED=true`), con `issuer-uri` al tenant específico (NUNCA `/common/` en prod) |
+| HTTPS | **Obligatorio** porque Azure AD exige redirect URIs HTTPS fuera de localhost. Se usa **Let's Encrypt (certbot)** con dominio propio apuntando al EC2 |
+| EC2 | **Desde cero**: el workflow `bootstrap.yml` instala Docker, clona los repos y levanta el stack completo |
+
+### 9.2 Repositorios en GitHub (todos públicos)
+
+| Repo GitHub | Carpeta local | Rol |
+| :--- | :--- | :--- |
+| `pasalapeli-database` | `Github/database/` | **Orquestador**: `init.sql`, `docker-compose.yml`, `.env.example`, workflow `bootstrap.yml` |
+| `pasalapeli-frontend` | `Github/frontend/` | Imagen del frontend Angular (nginx, HTTPS) |
+| `pasalapeli-bff-service` | `Github/bff-service/` | Imagen del BFF (Spring Boot 8080) |
+| `pasalapeli-movie-service` | `Github/movie-service/` | Imagen del Movie Service (Spring Boot 8082) |
+| `pasalapeli-ticket-service` | `Github/ticket-service/` | Imagen del Ticket Service (Spring Boot 8083) |
+| `pasalapeli-notification-service` | `Github/notification-service/` | Imagen del Notification Service (Spring Boot 8084, consumidor RabbitMQ) |
+
+### 9.3 Layout en EC2 - TOPOLOGÍA 3 EC2 (actual)
+
+```
+EC2-BDD:  MySQL 8 nativo + database/init.sql (sin Docker)
+EC2-APPS: /opt/pasalapeli/ con los CLONES de:
+            pasalapeli-database/  (docker-compose.yml + .env)
+            pasalapeli-bff-service/
+            pasalapeli-movie-service/
+            pasalapeli-ticket-service/
+            pasalapeli-notification-service/
+          docker compose up -d --build (rabbitmq/bff/movie/ticket/notification)
+EC2-WEB:  /opt/pasalapeli/ con:
+            pasalapeli-database/  (docker-compose.web.yml + .env)
+            pasalapeli-frontend/
+            certs/ (Let's Encrypt) montados en el contenedor nginx
+          docker compose -f docker-compose.web.yml up -d --build
+```
+
+Los `build.context` de los compose usan rutas relativas `../pasalapeli-*` porque los repos se clonan como hermanos (`pasalapeli-database` actúa como orquestador).
+
+### 9.4 Workflows de GitHub Actions
+
+| Repo | Workflow | Trigger | Acción |
+| :--- | :--- | :--- | :--- |
+| `pasalapeli-database` | `.github/workflows/bootstrap.yml` | push `main` | Setup EC2 desde cero (instalar Docker/certbot, clonar 5 repos, emitir/renovar certs, `docker compose up -d --build`) |
+| `frontend` | `.github/workflows/deploy.yml` | push `main` | `git pull` → `docker compose -f docker-compose.web.yml up -d --build frontend` → checklist de salud |
+| `bff-service` | `.github/workflows/deploy.yml` | push `main` | Ídem para `bff-service` |
+| `movie-service` | `.github/workflows/deploy.yml` | push `main` | Ídem para `movie-service` |
+| `ticket-service` | `.github/workflows/deploy.yml` | push `main` | Ídem para `ticket-service` |
+| `notification-service` | `.github/workflows/deploy.yml` | push `main` | Ídem para `notification-service` |
+
+Todos usan [`appleboy/ssh-action`](https://github.com/appleboy/ssh-action) con la clave privada en `secrets.EC2_SSH_KEY`.
+
+### 9.5 Secrets y Variables requeridos en GitHub
+
+**Secrets (crear en los 6 repos:** Settings → Secrets and variables → Actions → New repository secret):
+
+| Secret | Descripción |
+| :--- | :--- |
+| `EC2_HOST` | IP pública o dominio del EC2 |
+| `EC2_USER` | Usuario SSH (normalmente `ubuntu`) |
+| `EC2_SSH_KEY` | Clave privada SSH (pem) |
+
+**Variables de GitHub (repo `pasalapeli-database` y `pasalapeli-frontend`):**
+
+| Variable | Description | Dónde |
+| :--- | :--- | :--- |
+| `EC2_DOMAIN` | Dominio propio (ej. `peli.midominio.cl`). Si es vacío → bootstrap en modo pruebas (self-signed + CORS `*`) | database, frontend |
+| `CERTBOT_EMAIL` | Email para Let's Encrypt | database |
+| `EC2_APPS_HOST` | IP pública o DNS del EC2-APPS (backend). Obligatorio en topología 3 EC2; sin ella el frontend proxy'ía a `bff-service` (single-EC2) | frontend |
+
+**Secrets opcionales (repo `pasalapeli-database`) para el `.env` del stack** — **con fallback a defaults** definidos en `bootstrap.yml`, así que el bootstrap funciona sin configurarlos:
+
+| Secret | Fallback |
+| :--- | :--- |
+| `MYSQL_ROOT_PASSWORD` | `root` |
+| `SPRING_DATASOURCE_USERNAME` / `SPRING_DATASOURCE_PASSWORD` | `root` / `root` |
+| `AZURE_AUTH_ENABLED` | `false` |
+| `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_APP_ID_URI` | vacío |
+| `AZURE_AD_ISSUER_URI` / `AZURE_AD_JWK_SET_URI` | vacío |
+| `RABBITMQ_DEFAULT_USER` / `RABBITMQ_DEFAULT_PASS` | `pasalapeli` / `pasalapeli123` |
+
+> **Portadas:** se guardan en disco local dentro de EC2-APPS (volumen Docker `movie-uploads`); no requieren secretos ni credenciales de nube.
+
+**Regla de oro:** ningún secret hardcodeado en el código. Todos viajan por variables de entorno (`.env` en EC2) o GitHub Secrets/Variables.
+
+### 9.6 Variables de entorno del stack (`.env` en EC2)
+
+- `MYSQL_ROOT_PASSWORD=root` (o valor producido)
+- `SPRING_DATASOURCE_URL=jdbc:mysql://mysql:3306/pasalapeli_db?...` → valor real en producción: `jdbc:mysql://<IP_BDD>:3306/pasalapeli_db?...` (EC2-BDD)
+- `SPRING_DATASOURCE_USERNAME` / `SPRING_DATASOURCE_PASSWORD`
+- `MOVIE_SERVICE_URL=http://movie-service:8082`
+- `TICKET_SERVICE_URL=http://ticket-service:8083`
+- `AZURE_AUTH_ENABLED=true`
+- `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_APP_ID_URI`
+- `AZURE_AD_ISSUER_URI=https://login.microsoftonline.com/<tenant-id>/v2.0`
+- `AZURE_AD_JWK_SET_URI=https://login.microsoftonline.com/<tenant-id>/discovery/v2.0/keys`
+- `CORS_ALLOWED_ORIGINS=https://<dominio>`
+
+> Las portadas no usan variables de nube: `movie-service` las escribe en disco (`LOCAL_UPLOAD_DIR`, default `./uploads/peliculas`) y el volumen Docker `movie-uploads` las persiste en EC2-APPS.
+
+### 9.7 Cambios preparados en el código (estado)
+
+- **Actuator**: agregado `spring-boot-starter-actuator` a `bff-service`, `movie-service` y `ticket-service` + `HEALTHCHECK` en sus `Dockerfile` sobre `/actuator/health`.
+- **`.dockerignore`**: creado en los 4 repos de aplicación (excluye `target/`, `node_modules/`, `.git/`, IDE).
+- **`init.sql`**: reescrito — la versión original tenía los identificadores corruptos (backslashes que comían caracteres, ej. `\ombre\` en vez de `` `nombre` ``; no ejecutaba en MySQL).
+- **Frontend**: `environment.prod.ts` con placeholders reemplazados en build vía `ARG` de Docker; `nginx.conf` con HTTPS (puerto 443 + redirect de 80), certificados montados en `/etc/nginx/certs/`.
+- **BFF**: CORS configurable vía `CORS_ALLOWED_ORIGINS` (reemplaza el `*` fijo); `Azure AD real` por env vars ya implementado (`AZURE_AUTH_ENABLED`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`).
+
+### 9.7.1 Revisión de código del deploy (HECHO - bugs corregidos)
+
+1. `frontend/src/environments/environment.prod.ts`: comentarios con `#` (sintaxis inválida en TS) → reemplazados por `//`. Roto habría tumbado `ng build`.
+2. `bff-service SecurityConfig.java`: `/actuator/health` quedaba tras `anyRequest().authenticated()` → el HEALTHCHECK de Docker nunca llegaba a `healthy`. Ahora `/actuator/health**` e `/actuator/info` son `permitAll()`.
+3. `bootstrap-ec2.sh`: el `nginx` de apt se auto-iniciaba y ocupaba 80/443 → certbot `--standalone` fallaba. Ahora se `systemctl stop/disable nginx` antes de emitir certificados.
+4. Modo pruebas sin dominio: antes generaba `CORS_ALLOWED_ORIGINS=https://` y `APP_BASE_URL=https://` (rotos). Ahora test-mode ⇒ `*` y `https://localhost` (en `bootstrap.yml` y en el script).
+5. `bootstrap.yml`: las variables listadas en `envs:` NUNCA se definían en el workflow ⇒ se enviaban vacías. Ahora hay un bloque `env:` en el step con Secrets de GitHub + fallbacks (root/root, AZURE false, AWS false), por lo que el bootstrap funciona sin configurar ningún secret extra.
+6. Los 4 `deploy.yml` ahora **fallan (exit 1)** si el contenedor no queda `healthy` a los 150 s (antes terminaban en OK con el servicio caído).
+
+### 9.8 Tareas manuales pendientes (fuera del código)
+
+1. ✅ **HECHO** — Crear los 5 repos públicos en GitHub y subir cada carpeta local (repos de `vicebande`, branch `main`, origin configurado).
+2. Configurar los Secrets/Variables de GitHub por repo (tabla 9.5).
+3. Crear la instancia EC2 (Ubuntu 24.04), abrir en el Security Group los puertos **22, 80, 443**.
+4. Apuntar el dominio (registro A) a la IP pública del EC2.
+5. Registrar la app en Microsoft Entra ID: redirect URIs `https://<dominio>` (SPA) y exponer scope `api://pasalapeli-api/access_as_user`.
+6. Ejecutar primer push de `pasalapeli-database` (o `workflow_dispatch`) para el bootstrap inicial.
+7. Verificar `https://<dominio>/actuator/health` de cada servicio (los del BFF expuestos por el frontend/<dominio>/actuator).
+
+### 9.9 Notas de seguridad y buenas prácticas detectadas
+
+- CORS restrictivo por defecto en producción via `CORS_ALLOWED_ORIGINS`.
+- El frontend usa `http://` solo en dev; producción es HTTPS.
+
+### 9.10 Decisión de despliegue: TOPOLOGÍA DE 3 EC2 (11/09/2026)
+
+El usuario eligió **3 instancias EC2 separadas** en lugar de una sola. Cambios
+requeridos en el código para esta topología:
+
+| EC2 | Rol | Servicios | Puertos abiertos (SG) |
+| :--- | :--- | :--- | :--- |
+| `EC2-BDD` | Base de datos | MySQL 8 nativo (o MariaDB), `init.sql` | 22 (tu IP), 3306 (solo IP de EC2-APPS) |
+| `EC2-APPS` | Backend | Docker + rabbitmq (5672/15672), bff (8080), movie (8082), ticket (8083), notification (8084) | 22 (tu IP), 8080 (solo IP de EC2-WEB) |
+| `EC2-WEB` | Frontend | nginx (Angular) + proxy `/api` → EC2-APPS:8080 | 22 (tu IP), 80/443 (público) |
+
+Cambios en repos:
+- `docker-compose.yml` (pasalapeli-database): se **quita el servicio `mysql`** y el `frontend`; queda solo bff+movie+ticket para EC2-APPS.
+- Nuevo `docker-compose.web.yml` (pasalapeli-database): solo el `frontend` para EC2-WEB.
+- `bootstrap.yml` y `bootstrap-ec2.sh`: se agrega el relay de `SPRING_DATASOURCE_URL` y `CORS_ALLOWED_ORIGINS` (secrets con fallback) para apuntar a la BD externa.
+- `frontend/nginx.conf`: `proxy_pass` a `http://<IP_EC2_APPS>:8080/api/` (ya no al DNS `bff-service`).
+- `frontend/.github/workflows/deploy.yml`: despliega con `-f docker-compose.web.yml`.
+
+Secrets por repo: `EC2_HOST` apunta a la IP del EC2 propio (database/bff/movie/ticket → IP_APPS; frontend → IP_WEB). Secrets nuevos en `pasalapeli-database`: `SPRING_DATASOURCE_URL`, `CORS_ALLOWED_ORIGINS`. En `EC2_DOMAIN`/`CERTBOT_EMAIL` del repo database se dejan **vacíos** (el certificado se emite en EC2-WEB, no en APPS).
+
+### 9.10.1 ✅ Cambios de topología 3 EC2 APLICADOS EN EL CÓDIGO (11/09/2026)
+
+Las 5 ediciones obligatorias para la topología 3 EC2 ya están implementadas en los repos locales, **pendientes de push**. Detalle por rep:
+
+| Edición | Archivo | Cambio aplicado |
+| :--- | :--- | :--- |
+| 1 | `database/docker-compose.yml` | Eliminados los servicios `mysql` y `frontend`. Quedan solo `bff`, `movie`, `ticket`. La BD se resuelve por `SPRING_DATASOURCE_URL` (fallback `jdbc:mysql://<IP_BDD>:3306/pasalapeli_db?...`). |
+| 2 | `database/docker-compose.web.yml` (NUEVO) | Stack de EC2-WEB: solo `frontend`, puertos 80/443, certs montados de `./certs`. Build args: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `APP_BASE_URL`, `EC2_APPS_HOST`. |
+| 3a | `database/.github/workflows/bootstrap.yml` | Relay de `SPRING_DATASOURCE_URL` y `CORS_ALLOWED_ORIGINS` (secrets con fallback) en `env:` y `envs:`. Fix extra: `CORS_ALLOWED_ORIGINS` ya no se pisa con `*` en la rama "sin DOMAIN" — respeta el secret (`${CORS_ALLOWED_ORIGINS:-...}`). |
+| 3b | `database/scripts/bootstrap-ec2.sh` | Nuevas vars `SPRING_DATASOURCE_URL`/`CORS_ALLOWED_ORIGINS`; línea `SPRING_DATASOURCE_URL` en el heredoc del `.env`; sed de CORS usa el valor del secret. |
+| 4 | `frontend/nginx.conf` + `frontend/Dockerfile` | El `proxy_pass` de `/api/` ya no apunta fijo a `bff-service:8080`. Se hace **configurable** con ARG `EC2_APPS_HOST` (placeholder `A_PONE_APPS_HOST` reemplazado por `sed` en el build). Default `bff-service` (compatibilidad single-EC2); en la topología 3 EC2 se setea con la IP/URL de EC2-APPS. |
+| 5 | `frontend/.github/workflows/deploy.yml` | Usa `-f docker-compose.web.yml` y reenvía `EC2_APPS_HOST` (Variable de GitHub con fallback `bff-service`) al EC2-WEB. |
+
+**Nuevo requisito de configuración**: Variable de GitHub `EC2_APPS_HOST` en el repo `pasalapeli-frontend` = IP pública del EC2-APPS (o DNS/URL del backend). Sin ella, el frontend proxy'ía a `bff-service` (solo útil en single-EC2).
+
+**Verificación**: YAML de ambos compose validado (`python -c yaml.safe_load`). No hay `docker` local para ejecutar `compose config`. Workflow `bootstrap.yml` revisado a mano.
+
+**Pendiente de este hito** (manual, fuera del código):
+1. Commit + push de `pasalapeli-database` y `pasalapeli-frontend` (main).
+2. Configurar Secrets/Variables de GitHub (incluida `EC2_APPS_HOST`).
+3. Crear los 3 EC2, Elastic IPs, DNS y registrar la app en Entra ID.
+4. Bootstrap de EC2-APPS + deploy de frontend en EC2-WEB y verificación final.
+
+---
+
+## 10. CHANGELOG DE SESIÓN — Implementación de la topología 3 EC2 — 11/09/2026
+
+**Contexto:** Se revisó el proyecto. Se detectó que el código estaba en la topología antigua de 1 EC2 (compose con `mysql`+`frontend`, `nginx` apuntando a `bff-service`, sin relay de `SPRING_DATASOURCE_URL`). Se aplicaron los cambios necesarios para migrar a 3 EC2.
+
+1. `database/docker-compose.yml` → reescrito (solo backend; BD externa).
+2. `database/docker-compose.web.yml` → creado (solo frontend para EC2-WEB).
+3. `database/.github/workflows/bootstrap.yml` → relay `SPRING_DATASOURCE_URL` + `CORS_ALLOWED_ORIGINS` y fix del CORS pisado.
+4. `database/scripts/bootstrap-ec2.sh` → declaración de vars nuevas, línea en heredoc del `.env` y sed de CORS por secret.
+5. `database/.env.example` → documentada la URL de BDD externa (`jdbc:mysql://<IP_BDD>:3306/...`).
+6. `frontend/nginx.conf` → `proxy_pass` configurable (placeholder `A_PONE_APPS_HOST`).
+7. `frontend/Dockerfile` → nuevo `ARG EC2_APPS_HOST` + `sed` en `nginx.conf`.
+8. `frontend/.github/workflows/deploy.yml` → `-f docker-compose.web.yml` + `envs: EC2_APPS_HOST`.
+
+**Revisión de errores del despliegue (11/09/2026, post-cambio de topología):**
+
+Se revisaron todos los archivos del flujo (compose, workflows, Dockerfiles, nginx, scripts) contra la topología 3 EC2. Se corrigieron 3 errores y se agregaron 2 mejoras:
+
+| Hallazgo | Severidad | Fix |
+| :--- | :--- | :--- |
+| `renew-certs.sh` hacía `docker compose stop/up frontend` sobre `docker-compose.yml`, pero ese servicio ya no existe en el compose de EC2-APPS (edición 1) → la renovación del cert en EC2-WEB fallaría. | Alta (bloquea en 3 EC2) | Ahora usa `docker-compose.web.yml` si existe (fallback a `docker-compose.yml` para single-EC2). |
+| En `bootstrap.yml`, `APP_BASE_URL` (y CORS) eran variables de shell no exportadas → `bootstrap-ec2.sh` (subproceso) las recibía vacías y producía `APP_BASE_URL=https://localhost` aun con dominio. | Media | `export APP_BASE_URL CORS_ALLOWED_ORIGINS SPRING_DATASOURCE_URL` antes de invocar el script. |
+| El `deploy.yml` del frontend no reenviaba los ARG de Azure (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `APP_BASE_URL`) al build en EC2-WEB → con Entra ID real el login rompería (redirectUri/clientId con placeholders). | Alta (bloquea login prod) | Se relayan como Variables de GitHub con fallbacks; `APP_BASE_URL` se deriva de `EC2_DOMAIN` si viene vacío. |
+| `bootstrap-ec2.sh` terminaba "OK" sin esperar el healthcheck (lo esperado era que los servicios quedaran healthy). | Media | Loop de espera de healthy (180 s) sobre `pasalapeli-bff/movie/ticket` + `exit 1` si fallan (visibiliza errores de `SPRING_DATASOURCE_URL`). |
+| Sección 7 del maestro apuntaba a `D:\Pasa La Peli\Github\docker-compose.yml` (inexistente). | Docs | Actualizada: compose en `Github/database/` (APPS) y `docker-compose.web.yml` (WEB). |
+
+**Decisiones de diseño de esta sesión:**
+- **`EC2_APPS_HOST` como build ARG** (en vez de hardcodear la IP en `nginx.conf`): permite cambiar la IP sin editar y pushear código; se controla por Variable de GitHub.
+- El **fallback** del compose/heredoc para `SPRING_DATASOURCE_URL` queda en `jdbc:mysql://mysql:3306/...`: solo es un safety-net; el valor real se inyecta por el secret `SPRING_DATASOURCE_URL`.
+- No se tocó el código Java: `movie-service` y `ticket-service` ya leían `SPRING_DATASOURCE_URL` desde variables de entorno (`application.yml`).
+
+**Notas pendientes para agentes futuros:**
+- Al desplegar, el secret `SPRING_DATASOURCE_URL` del repo `pasalapeli-database` debe apuntar a `jdbc:mysql://<IP_BDD>:3306/pasalapeli_db?...` (EC2-BDD). Si falta, los microservicios intentarán resolver el host `mysql` (eliminado del compose) y quedarán no-healthy.
+- La Variable `EC2_APPS_HOST` del repo `pasalapeli-frontend` es obligatoria en la topología 3 EC2.
+
+## 11. CAMBIO AL WORLD - ALINEACIÓN CON EL CÓDIGO REAL (11/09/2026)
+
+**Contexto:** Revisión integral del proyecto (builds OK: `ng build` + `mvn compile` de los 3 servicios). Se detectó que la documentación describía una arquitectura que no coincide con el código (AWS API Gateway, imagen_url, Factory Method/Circuit Breaker/Retry, topología 1 EC2). Se aplicaron estas correcciones documentales:
+
+1. Se eliminó toda mención operativa a **AWS API Gateway** (módulos §§2 y 5 - Flujo 5 nuevo) y se documentó el **proxy `/api` de Nginx** (EC2-WEB → EC2-APPS:8080).
+2. Se documentó la **topología de 3 EC2** (EC2-BDD / EC2-APPS / EC2-WEB) en el mermaid de la sección 2, en la sección 3 (Frontend y Base de Datos), en la sección 7 (layout 9.3, workflow frontend 9.4, variable `EC2_APPS_HOST`) y se aclaró el valor de producción de `SPRING_DATASOURCE_URL` (9.6).
+3. Se corrigió el campo de BD (`imagen`) y se agregó la regla R4 prohibiendo `imagen_url` (sección 8).
+4. Se marcaron **Factory Method / Circuit Breaker / Retry como NO implementados** (propuesta) junto con sus alternativas reales (lock pesimista, timeouts, fallbacks locales) — secciones 5 (Flujo 5) y 8 (R1-R2).
+5. Se sincronizaron las **5 copias** en `Github/{frontend,database,bff-service,movie-service,ticket-service}/PROJECT_CONTEXT.md` con el maestro (antes contenían la versión monorepo/1-EC2 desactualizada).
+
+## 12. REVISIÓN FINAL DE FUNCIONAMIENTO LÓGICO Y FIXES APLICADOS (11/09/2026)
+
+**Contexto:** Revisión integral del código de los 5 repos (4 agentes en paralelo: ticket, movie, bff y frontend) + verificación de builds (`mvn compile` × 3 y `ng build`). Se corrigieron todos los hallazgos reales y se pusheó a `main`.
+
+**Hallazgos y fixes por repo:**
+
+| Repo | Hallazgo | Fix aplicado |
+| :--- | :--- | :--- |
+| ticket-service | **CRÍTICO**: `cantidad` nunca se persistía; todas las lecturas devolvían `1` | Campo `cantidad` en `Ticket.java`; se asigna en `procesarCompra`; `mapToDTO` lee `t.getCantidad()` |
+| ticket-service | `consultarDisponibilidad` podía retornar body null | Guard que lanza error claro |
+| ticket-service | Faltaban handlers 400/405 (path convoy parse, body ilegible, query faltante, método no soportado) | Nuevos handlers en `GlobalExceptionHandler` |
+| database | Esquema sin `cantidad` en `Ticket`; seeds incoherentes | Columna `cantidad INT NOT NULL DEFAULT 1` + seed 2 a `cantidad=2` con pago 9600 |
+| bff-service | **ALTO**: error de compra se enviaba como JSON-String (Content-Type inconsistente, rompía el manejo de error del frontend) | `TicketClient.comprarTicket` parsea el body a `Map` con Jackson |
+| bff-service | No existía `GET /api/tickets` (raíz) y la identidad se resolvía solo dentro de `/me` | Nuevo `UsuarioContext` (find-or-create por correo + fallback demo) y endpoint raíz para listar mis tickets del autenticado |
+| movie-service | **ALTO**: N+1 en `listarPeliculas` (acceso lazy a funciones por fila) | `findAllWithFunciones()` + nuevo `buscarPorTituloConFunciones()` con `LEFT JOIN FETCH` |
+| movie-service | Faltaban handlers 400/405 | Añadidos a `GlobalExceptionHandler` |
+| frontend | no mostraba la cantidad de entradas compradas | Fila "N entrada(s)" en `mis-tickets` usando `t.cantidad` |
+
+**Aclaración de diseño (importante para agentes futuros):** el pago es **100 % simulado** (frontend avisa "pago simulado"; `Pago` se crea con `estado=APROBADO` directo y `monto = cantidad × precio`; no existe gateway externo). Por ello **NO corresponde** implementar saga/compensación ni orquestar pagos reales. La consistencia stock↔ticket se apoya en disponibilidad en tiempo real + lock pesimista al descontar (`findByIdForUpdate`), suficiente para el alcance del proyecto.
+
+**Docs sincronizados:** `PROJECT_CONTEXT.md` maestro + 5 copias idénticas. Se eliminaron las notas de "producción madura" no esenciales del §9.9.
+
+**Estado final:** repos `main` en sync con `origin/main` (0 ahead / 0 behind), working trees limpios. Ver "Hallazgos y fixes por repo" (§12) y §16.2.
+
+## 13. DESPLIEGUE REAL EN AWS — TOPOLOGÍA 3 EC2 DESPLEGADA Y VERIFICADA (12/09/2026)
+
+**Contexto:** Se desplegó por primera vez la topología completa de 3 EC2 en AWS y se cerró la sesión con **APPS healthy (bff/movie/ticket)**, **WEB healthy (frontend)** y la app accesible vía `https://<IP_WEB>` (certificado autofirmado, modo pruebas sin dominio).
+
+### 13.1 Infraestructura AWS REAL (consola AWS)
+
+- 3 instancias **Ubuntu 24.04** con **Elastic IP** cada una (SSH por IP pública).
+- **Subredes reales** (al lanzar con "VPC and more", AWS genera CIDR `/20`, NO los `/24` inicialmente planeados):
+  - `WEB` → `10.0.0.0/20` — IP privada de WEB real: `10.0.6.8`
+  - `APPS` → `10.0.16.0/20` — IP privada de APPS real: `10.0.25.197`
+  - `BDD` → `10.0.32.0/20` — IP privada de BDD real: `10.0.40.200` (3ª subred, creada a mano)
+- **Security Groups por REFERENCIA A OTRO SG** (no CIDR `/24`): BDD `3306` ← `sg-pasalapeli-apps`; APPS `8080` ← `sg-pasalapeli-web`; WEB `80/443` público; `22` solo a la IP del desarrollador. OJO: AWS NO permite convertir una regla CIDR existente a referencia de SG → hay que borrar y recrear la regla.
+- **Main route table sin ruta default** → se agregó `0.0.0.0/0 → IGW` a mano (sin ella, `apt-get` y las salidas a internet de BDD fallaban).
+
+### 13.2 Base de datos (EC2-BDD)
+
+- MySQL 8 **nativo** (sin Docker). Usuario `pasalapeli@'%'` (`caching_sha2_password`), DB `pasalapeli_db`, **5 tablas** cargadas desde `init.sql`. Los microservicios la alcanzan por `jdbc:mysql://<IP_PRIVADA_BDD>:3306`.
+
+### 13.3 Cómo quedó el deploy (modo pruebas SIN dominio)
+
+- Sin dominio → **certificado autofirmado** en WEB (la advertencia del navegador es esperada), **Azure deshabilitado** (no se crean secrets `AZURE_*`), **CORS `*`** (no se crea `CORS_ALLOWED_ORIGINS`).
+- `EC2_APPS_HOST` = **IP PRIVADA de APPS** (`10.0.25.197`): el proxy `/api` de nginx usa esa IP (resuelve al arranque). **Nunca** usar el hostname `bff-service` (solo existe en la topología single-EC2).
+
+### 13.4 Secrets y Variables finales en GitHub
+
+| Ítem | Repos | Valor |
+| :--- | :--- | :--- |
+| Secret `EC2_HOST` | database, bff-service, movie-service, ticket-service | IP **pública** de EC2-APPS |
+| Secret `EC2_HOST` | frontend | IP **pública** de EC2-WEB |
+| Secret `EC2_USER` | los 5 | `ubuntu` |
+| Secret `EC2_SSH_KEY` | los 5 | contenido del `.pem` |
+| Secret `SPRING_DATASOURCE_URL` | database | `jdbc:mysql://10.0.40.200:3306/pasalapeli_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC` |
+| Secret `SPRING_DATASOURCE_USERNAME` | database | `pasalapeli` |
+| Secret `SPRING_DATASOURCE_PASSWORD` | database | `[REDACTED]` |
+| Variable `EC2_APPS_HOST` | frontend | `10.0.25.197` (IP **privada** de APPS) — obligatoria |
+
+- `EC2_DOMAIN` / `CERTBOT_EMAIL` **vacías** (modo pruebas) en database y frontend.
+- La IP de la BDD vive **solo** en el secret `SPRING_DATASOURCE_URL`; el `.env` en `/opt/pasalapeli/pasalapeli-database/.env` la reparte a los 3 contenedores vía compose.
+
+### 13.5 Bugs de pipelines encontrados y corregidos (12/09/2026)
+
+| Fallo observado | Causa raíz | Fix aplicado |
+| :--- | :--- | :--- |
+| Bootstrap: `Permission denied` al escribir `privkey.pem` | `bootstrap-ec2.sh` hacía `sudo chown` NO recursivo sobre `/opt/pasalapeli` → `certs/` quedaba root | `sudo chown -R "$(whoami)" "$APP_DIR"` |
+| Bootstrap: `unable to prepare context: path ".../pasalapeli-movie-service" not found` | `REPO_OWNER` / `DOMAIN` / `CERTBOT_EMAIL` no se exportaban a `bootstrap-ec2.sh` (solo `APP_BASE_URL`, `CORS`, `SPRING_DATASOURCE_URL`) → el loop de clonado se saltaba | `export APP_BASE_URL CERTBOT_EMAIL CORS_ALLOWED_ORIGINS DOMAIN REPO_OWNER SPRING_DATASOURCE_URL` |
+| Deploy de bff/movie/ticket: `Error: missing server host` | Faltaban los secrets `EC2_USER` y `EC2_SSH_KEY` en esos 3 repos (solo existía `EC2_HOST`) | Secrets seteados vía `gh secret set` (EC2_SSH_KEY leído de `D:\Pasa La Peli\pasalapeli-key.pem`) |
+| nginx crash-loop: `[emerg] host not found in upstream "bff-service"` | Variable `EC2_APPS_HOST` **no existía** en el repo frontend → caía al fallback `bff-service`, que no resuelve en EC2-WEB | Creada la Variable `EC2_APPS_HOST=10.0.25.197`; además `deploy.yml` ahora **exige** la variable con mensaje claro en vez del fallback |
+| Frontend `unhealthy` constante (nginx corriendo) | El HEALTHCHECK `wget https://localhost/` resolvía `localhost` a `[::1]:443` (IPv6) y nginx escucha solo IPv4 | HEALTHCHECK con `https://127.0.0.1/` |
+
+Además se creó `database/scripts/bootstrap-web.sh` (autoprepara EC2-WEB: Docker, clon de database+frontend, cert autofirmado o Let's Encrypt según `EC2_DOMAIN`, cron de renovación) y `frontend/.github/workflows/deploy.yml` quedó como **deploy único** (baja el script, lo ejecuta, `git pull` + `docker compose -f docker-compose.web.yml up -d --build frontend`, healthcheck, verificación HTTPS).
+
+### 13.6 Estado verificado al cierre
+
+- **APPS**: `bff-service` :8080, `movie-service` :8082, `ticket-service` :8083 — **healthy** (bootstrap success 2m48s; deploys individuales verdes 13–21 s).
+- **WEB**: contenedor `pasalapeli-frontend` **healthy** (deploy 54 s). Sitio accesible en el navegador por `https://<IP_WEB>` (IP pública WEB = `<IP_PUBLICA_WEB>`); se acepta la advertencia self-signed (MOZILLA_PKIX_ERROR_SELF_SIGNED_CERT esperado) y carga la cartelera.
+- Todos los repos en `main` sincronizado con `origin/main`; working trees limpios.
+
+### 13.7 Para agentes futuros
+
+- Para activar un **dominio real**: crear variables `EC2_DOMAIN` + `CERTBOT_EMAIL` en `pasalapeli-frontend` (y `EC2_DOMAIN`/`CERTBOT_EMAIL` en `pasalapeli-database` si se quiere cert en APPS). El flujo emitirá Let's Encrypt **antes** de levantar el contenedor y el workflow verificará HTTPS. No hacerlo a mano.
+- Para redesplegar un servicio puntual en APPS: push a su repo (workflow `Deploy X a EC2`, ya verdes) o `workflow_dispatch`. El bootstrap sigue disponible y es re-ejecutable (idempotente).
+- **CUIDADO**: la clave `D:\Pasa La Peli\pasalapeli-key.pem` es sensible — nunca pushearla a GitHub (no está en ningún repo).
+
+## 14. MEJORAS DE TICKETS / PAGO: FILTRADO POR USUARIO REAL, VALIDACIÓN DE TARJETA Y FIX MSAL (14/09/2026)
+
+### 14.1 Contexto
+
+Tras la verificación del deploy en producción (Azure AD activo) se reportaron dos problemas:
+1. **Mis Entradas mostraba los mismos tickets** para la cuenta admin y la cuenta cliente.
+2. Después de pagar, el **modal no se cerraba** y se iba directo a Mis Entradas; además faltaban **validaciones** en el modal de pago (no se rechazaban fechas imposibles como mes 13 o tarjetas vencidas).
+
+Y al migrar "Mis Entradas" a un endpoint nuevo, apareció un fallo de producción: **"No fue posible cargar el historial de tickets"**.
+
+### 14.2 Causa raíz del filtrado de tickets
+
+- El frontend consultaba `GET /api/tickets/usuario/{id}` con un `usuarioId` que él mismo derivaba (`authService.getUserId()`), que en modo **Azure** quedaba en `2` hasta que terminara la sincronización con `/api/auth/me` → admin y cliente veían los tickets del usuario `2`.
+- El BFF **confiaba** en el `usuarioId` que enviaba el cliente al comprar.
+
+**Solución:** el BFF ahora resuelve el usuario real desde la autenticación (JWT de Azure o cabeceras `X-Dev-*` en demo) e **ignora** el `usuarioId` del cliente. "Mis Entradas" pasa a usar `GET /api/tickets` (endpoint autenticado del BFF que resuelve el usuario en servidor).
+
+### 14.3 Cambios aplicados
+
+**BFF Service**:
+- `TicketBffController.comprarTicket`: ahora recibe `Authentication`, resuelve el usuario con `UsuarioContext.resolverUsuario(...)` y **sobrescribe** `usuarioId` en el request (no se confía en el del cliente). Devuelve 401 si no hay usuario autenticado.
+- `GET /api/tickets` (listarMisTickets) ya resolvía el usuario en servidor; se convierte en el endpoint canónico para "Mis Entradas".
+
+**Frontend**:
+- `ticket.service.ts`: `getMisTickets()` ahora llama a `GET /api/tickets` (sin `usuarioId` en la URL).
+- `compra-ticket.component.ts|html|css`:
+  - **Validación por campo**: errores específicos para titular, número (16 dígitos), vencimiento (mes 01–12, formato `MM/AA`, rechaza tarjetas vencidas) y CVV (3–4 dígitos). CSS `field-error-input`/`field-error-msg`.
+  - **Cierre del modal**: al redirigir a `/mis-tickets` ahora emite `cerrar()` antes de navegar, para que el modal se cierre correctamente.
+
+**Frontend fix MSAL**:
+- `msal.config.ts`: `protectedResourceMap` ahora incluye la clave **exacta** `/api/tickets` (además del comodín `/api/tickets/*`). Sin ella, el `MsalInterceptor` no adjuntaba el Bearer JWT al `GET /api/tickets` → BFF devolvía 401 → "No fue posible cargar el historial de tickets" (y tras comprar, la redirección a Mis Entradas fallaba igual).
+
+### 14.4 Verificado
+
+- Deploys verdes: frontend `34817326260` + `34818087862`, bff `34817326875`.
+- `GET /api/tickets` sin JWT devuelve `401` (esperado en producción con Azure); con producción redeployada el interceptor ya envía el Bearer.
+- Mecánica del filtrado: en demo los correos `admin@pasalapeli.cl` (id 1) y `vicente.banderas@pasalapeli.cl` (id 2) del `init.sql` se resuelven por email vía `UsuarioService.ensureUsuario`.
+
+### 14.5 Para agentes futuros
+
+- **NUNCA** confiar en un `id` de usuario que venga del cliente ni en `getUserId()` del frontend para filtrar datos: resolver siempre el usuario en el BFF desde la autenticación (`UsuarioContext.resolverUsuario`).
+- Si "Mis Entradas" deja el endpoint `GET /api/tickets`, recordar que el `protectedResourceMap` del `MsalInterceptor` debe incluir la clave exacta (MSAL no expande `/api/tickets/*` para `/api/tickets`).
+- El DB seed mantiene los usuarios demo con correos `admin@pasalapeli.cl` y `vicente.banderas@pasalapeli.cl`; el `ensureUsuario` del ticket-service es find-or-create por email.
+
+## 15. DEVOLUCIÓN DE TICKETS + FIX MODAL DE COMPRA + DIAGNÓSTICO FUNCIONES (14/09/2026)
+
+### 15.1 Contexto
+
+Se reportaron 4 incidencias: (1) la simulación de pago "dice que falló" pero el ticket sí se crea en "Mis Entradas"; (2) el modal de compra no se cerraba ni redirigía a `/mis-tickets` al terminar; (3) en el panel admin solo se podía agregar UNA fecha/función a una película (la segunda fallaba); (4) faltaba poder DEVOLVER tickets y que se liberaran los asientos.
+
+### 15.2 Cambios aplicados
+
+**movie-service**:
+- `FuncionService.reponerEntradas(funcionId, cantidad)` + endpoint `PUT /api/funciones/{id}/reponer?cantidad=N`: con lock pesimista (`findByIdForUpdate`) suma cupos a `entradas_disponibles` y devuelve `DisponibilidadDTO`. Es la contraparte de `/descontar`.
+- `GlobalExceptionHandler.handleGeneric`: ahora usa `@Slf4j` y loguea la excepción con stacktrace para visibilizar errores no controlados (diagnóstico del punto 3).
+
+**ticket-service**:
+- `TicketService.devolverTicket(id)`: 404 si no existe; 409 (nueva excepción `TicketYaDevueltoException`) si `estado != PAGADO`; llama `MovieServiceClient.reponerEntradas` para liberar `cantidad` asientos y **elimina físicamente el ticket** (`ticketRepository.delete`); el `Pago` cae en cascada (FK `ON DELETE CASCADE`). Devuelve el DTO construido antes del borrado.
+- `MovieServiceClient.reponerEntradas`: PUT a movie-service `/api/funciones/{id}/reponer`.
+- `TicketController`: `POST /api/tickets/{id}/devolver` → 200 con DTO.
+
+**bff-service**:
+- `TicketClient.devolverTicket(id)`: POST a ticket-service con mapeo de errores estructurados.
+- `TicketBffController`: `POST /api/tickets/{id}/devolver` (authenticated); verifica que `ticket.usuarioId == usuario resuelto` (si no → 403). Regla: la devolución solo la puede realizar el dueño.
+- `GlobalExceptionHandler`: `@Slf4j` y logging de 4xx/5xx/genéricos para diagnóstico.
+
+**frontend**:
+- `ticket.service.ts`: `devolverTicket(id)` → `POST /api/tickets/{id}/devolver`.
+- `mis-tickets`: botón **"Devolución"** (icono `fa-rotate-left`, estilo `btn-refund`) solo en tickets `PAGADO`; abre **modal de 2da confirmación** (`.modal-backdrop` + `.refund-modal`) con resumen del ticket (película, entradas, asientos a liberar, monto) y botones Cancelar / Confirmar; tras éxito recarga la lista (el ticket eliminado ya no aparece) y muestra `mensajeExito`.
+- `compra-ticket.component.ts`:
+  - Guard `compraEnCurso` a nivel JS: elimina el doble POST (la causa del "falso 409": el 1º creaba el ticket y el 2º respondía 409, dejando el modal abierto y sin redirigir).
+  - `confirmarPago` → llama directo a `confirmarCompra` (un solo flujo, sin timer frágil previo). Spinner mínimo de 1.2 s (`finalizarCompraExitosa`).
+  - Éxito → SIEMPRE `cerrar.emit()` + `router.navigate(['/mis-tickets'])`.
+  - Error no-409 → `verificarCompraRealizada`: consulta `GET /api/tickets` y si existe un ticket de la misma función/cantidad con `fechaCompra` reciente (≤2 min) lo trata como éxito (modo "falso error"); si no, muestra el error real.
+- `admin.component.ts`: `guardarFuncion` muestra `err.error?.message` real (y `console.error`) en vez del `alert('Error al guardar la función.')` genérico, para destapar la causa del punto 3 (la nueva regla es: el mensaje real del backend siempre debe llegar al usuario).
+
+### 15.3 Notas de diseño
+
+- **Devolución = DELETE**: a pedido del cliente, la devolución elimina el ticket (y su `Pago` en cascada) para que no figure más en "Mis Entradas"; la liberación de asientos sigue vía movie-service `/reponer` con lock pesimista (misma consistencia que `/descontar`).
+- El `Pago` ya no queda como historial: el delete del `Ticket` lo borra en cascada (FK `Pago.ticket_id -> Ticket.id` con `ON DELETE CASCADE`).
+- El admin "segunda función" no tiene bloqueo en `init.sql` (sin UNIQUE en `Funcion`); el fix inmediato es visibilizar el error real para conocer la causa exacta y, si aparece un constraint/validación inesperada, corregir la causa raíz.
+
+### 15.4 Para agentes futuros
+
+- Al comprar, NUNCA disparar dos POST de `/api/tickets/comprar` para la misma compra: usar el guard `compraEnCurso` del modal (o idempotencia servidor).
+- El endpoint de devolución está en BFF `/api/tickets/{id}/devolver` (dueño) → ticket-service → movie-service `/reponer`. Mantener el orden: reponer cupos + eliminar el ticket en la misma transacción del ticket-service.
+
+### 15.5 Hardening de deploys (15/09/2026): lock entre repos
+
+**Incidente:** al pushear los 4 repos a la vez, los workflows de movie-service y bff-service corrieron en paralelo contra el mismo EC2-APPS y `docker compose up` chocó (`container name "/pasalapeli-movie" is already in use`). movie y bff no quedaron recreados; sin contenedor `pasalapeli-bff` toda la API devolvía 502 (`/api/auth/me`, `/api/cartelera`, `/api/tickets`).
+
+**Solución aplicada en los 4 `deploy.yml` y en el `bootstrap.yml` de database:**
+- Lock compartido en el host con `flock -x -w 1800 /tmp/pasalapeli-deploy.lock` (fd 9), que serializa `docker compose up -d --build` entre repos sobre el mismo EC2 (APPS para movie/ticket/bff + bootstrap; WEB para frontend). Si un deploy se demora >30 min, falla en vez de estrellarse.
+- Liberación explícita `flock -u 9`; ante fallo, el cierre del fd por salida del script libera el lock igualmente.
+- `bootstrap.yml` (database): además recibe `concurrency: { group: bootstrap-ec2-pasalapeli, cancel-in-progress: true }` para que un push nuevo cancele un bootstrap previo en cola (un push de solo docs no debería re-bootstrapear todo).
+
+**Recuperación manual usada:** entrar por SSH a EC2-APPS y ejecutar en secuencia `docker compose -f /opt/pasalapeli/pasalapeli-database/docker-compose.yml up -d --build <servicio>`; verificar `.State.Health.Status` = `healthy` y `curl` al `/api/cartelera` desde EC2-WEB.
+
+**Regla:** con el lock ya es seguro empujar los repos casi a la vez (se encolan), pero para un release conviene mantener pushes secuenciales y esperar que cada workflow quede verde.
+
+### 15.6 FIX ESTRUCTURAL: mayúsculas vs minúsculas en la BDD (15/09/2026)
+
+**Hallazgo:** Hibernate 6 (ORM 6.5.2) minúsculiza los nombres EXPLÍCITOS no comillados de `@Table(name = "Pelicula")` en su estrategia de naming por defecto. Por eso movie-service y ticket-service terminaron creando/leyendo tablas `pelicula`, `funcion`, `ticket`, `pago`, `usuario` (minúsculas) e IGNORARON el esquema de `init.sql` (mayúsculas: `Pelicula`, `Funcion`, `Ticket`, `Pago`, `Usuario`). En prod: movie no veía las funciones del seed (`/api/funciones/1/disponibilidad` → 404), la cartelera mostraba solo "Niu Lai"/"La Odisea" con `funciones: []` y comprar/devolver fallaban al reponer/descontar.
+
+**Solución (código):** en `movie-service` y `ticket-service`, `spring.jpa.hibernate.naming.physical-strategy: org.hibernate.boot.model.naming.PhysicalNamingStrategyStandardImpl` (preserva los nombres explícitos). bff no tiene persistencia directa. (workflows verdes, 1m08s/1m11s).
+
+**Migración aplicada en EC2-BDD (10.0.40.200/pasalapeli_db):**
+- Usuarios reales de Azure insertados en `Usuario` (mayúsculas) con ids 4-6: vi.banderas@pasalapeli.cl, cliente@pasalapeli.onmicrosoft.com, mart.vergaral@pasalapeli.cl.
+- Stock de `Funcion` restablecido al seed exacto: 45,50,30,40,60,1,50,50,55.
+- Eliminados TODOS los tickets/pagos (mayúsculas y minúsculas) a pedido del cliente; "Mis Entradas" queda vacío.
+- DROP de las tablas minúsculas huérfanas (`pago, ticket, funcion, pelicula, usuario`); la BDD final coincide con `init.sql` (`Usuario, Pelicula, Funcion, Ticket, Pago`).
+
+**Validación E2E post-fix:** comprar (usuario 5, función 1, cantidad 2) → ticket PAGADO + pago creados en `Ticket`/`Pago`, stock 45→43; `POST /api/tickets/{id}/devolver` → 200, ticket y pago ELIMINADOS, stock 45. Cartelera pública OK (catálogo seed con funciones y stock).
+
+**Regla:** NO incorporar `@Table`/`@Column` asumiendo el caso exacto: Hibernate 6 minúsculiza identificadores no comillados. Mantener `PhysicalNamingStrategyStandardImpl` en los repos con JPA y validar contra `information_schema` + E2E comprar→devolver→stock luego de cualquier cambio de datasource/jpa.
+
+### 15.7 Operativo de diagnóstico (15/09/2026): accesos, red y consulta BDD
+
+- **EC2-BDD**: IP **privada** `10.0.40.200` = IP **pública** `<IP_PUBLICA_BDD>` (misma instancia, hostname `ip-10-0-40-200`). MySQL 8 corre **nativo** ahí (no es contenedor); en `ss` no aparece Docker. SSH funciona con la misma clave `pasalapeli-key.pem` (usuario `ubuntu`) — se reutiliza desde EC2-APPS copiándola a `/tmp` con `chmod 600`. El puerto 3306 público suele estar cerrado por Security Group: usar siempre la IP privada desde la VPC.
+- **Consulta/scripteo de la BDD desde EC2-APPS** (imagen `mysql:8` ya descargada): subir archivo `.sql` por scp al `/tmp` y ejecutar
+  `docker run -i --rm -v /tmp/x.sql:/tmp/x.sql -e 'MYSQL_PWD=<password pasalapeli>' mysql:8 mysql -h10.0.40.200 -upasalapeli < /tmp/x.sql`.
+  En PowerShell NO usar `-e "SQL"` inline ni `>` / `|` hacia comandos remotos (rompen el parseo): siempre archivo SQL + `<`.
+- **Red interna de contenedores en EC2-APPS**: el compose define `name: pasalapeli`, por lo que la red es **`pasalapeli_pasalapeli-net`** (NO `pasalapeli-net`). Puerto interno de ticket-service = **8083** (NO publicado en el host); movie-service = **8082** (publicado); bff = **8080** (publicado).
+- **Probar endpoints internos** (curl desde la red, puede haber imagen `curlimages/curl`): `docker run --rm --network pasalapeli_pasalapeli-net curlimages/curl -s http://movie-service:8082/...`.
+- **Pista de diagnóstico:** el SQL logueado por Hibernate aparecía en minúscula (`from pelicula p1_0`) → fue la pista del bug de naming (§15.6). Revisar `docker logs <contenedor>` y el `show-sql: true` activo en los services para ver el nombre físico real de cada entidad.
+- **`/proc/net/tcp` del contenedor** sirvió para confirmar a qué IP/puerto real se conecta cada servicio (decodificar IP hex little-endian), útil cuando hay sospechas de datasources duplicados.
+
+### 15.8 Incidente 502 en POST de compra/devolución (15/09/2026): `Transfer-Encoding: chunked` duplicado
+
+- **Síntoma:** en el navegador, `POST /api/tickets/comprar` y `/{id}/devolver` devolvían "502 Bad Gateway" de nginx (respuesta de 497 B, `Content-Type: text/html`, Server nginx/1.31.5), aunque la operación **se ejecutaba y persistía** (el ticket se creaba/eliminaba en la BDD). "Mis Entradas" al recargar mostraba el resultado real.
+- **Causa raíz:** el BFF reenvía el `ResponseEntity<?>` cruto de ticket-service obtenido con `RestTemplate.postForEntity`. Ese objeto arrastra el header hop-by-hop `Transfer-Encoding: chunked` del downstream; al escribir la respuesta, Tomcat del BFF emite su propio `Transfer-Encoding: chunked` → el nginx de la WEB (HTTP/1.1) recibe el header **duplicado** y corta con 502: `upstream sent duplicate header line: "Transfer-Encoding: chunked" while reading response header from upstream`.
+- **Evidencia:** en la WEB, `docker logs pasalapeli-frontend` muestra ese error + `502 497` en el `access.log` para CADA POST de tickets (comprar y devolver); los GET (mis-tickets, cartelera) no fallan porque no arrastran headers del downstream.
+- **Fix (bff-service):** en `TicketClient.comprarTicket` y `TicketClient.devolverTicket` ya NO se devuelve el `ResponseEntity` crudo: se reconstruye uno limpio con `ResponseEntity.status(resp.getStatusCode()).body(resp.getBody())` (solo status + body, sin headers ajenos). `MovieClient` ya usaba `getBody()` y no estaba afectado.
+- **Regla:** nunca devolver tal cual un `ResponseEntity` interno de RestTemplate/WebClient como respuesta del BFF: libra headers hop-by-hop (`Transfer-Encoding`, `Connection`) que colisionan con Tomcat/nginx. Devolver siempre un `ResponseEntity` nuevo con `status().body()` y dejar que Spring/Tomcat genere los headers.
+
+### 15.9 Modal de Términos y Condiciones antes del login (15/09/2026)
+
+- **Requisito:** al pulsar "Iniciar Sesión" debe aparecer un modal con Términos y Condiciones; el botón de login queda deshabilitado hasta marcar la casilla de aceptación. Solo entonces se dispara el flujo OAuth2 de Microsoft (MSAL `loginRedirect`).
+- **Implementación (frontend):** nuevo componente standalone `components/terminos` (`TerminosComponent` con `@Output` `aceptado`/`rechazado`). `NavbarComponent.login()` ya NO llama directo a `authService.login()`: abre el modal; `aceptarTerminos()` cierra el modal y recién ahí llama a `authService.login()` (que hace `msalService.loginRedirect` a Microsoft Entra ID). Checkbox con `ngModel` (importa `FormsModule`).
+- **Contenido legal (CLP):** Ley N° 19.628 (protección de datos personales), Ley N° 19.496 + Ley N° 21.398 (consumidor; retracto 10 días NO aplica a entradas por tener fecha/hora determinada, pero la plataforma ofrece devolución propia), Ley N° 19.132 (clasificación cinematográfica/edad), Ley N° 19.799 (validez de documentos electrónicos) y emisión de boleta electrónica según SII.
+
+### 15.10 Fix: columna `sala` VARCHAR(20) → VARCHAR(50) (15/09/2026)
+
+- **Síntoma:** al programar una función "Sala 4 - 2D Tradicional" (23 caracteres) el admin recibía 500: `Data too long for column 'sala' at row 1` (MySQL en modo strict) en `insert into Funcion (...,sala,...) values (...)`.
+- **Causa:** el esquema (`init.sql`) definía `sala` como `VARCHAR(20)`, pero las opciones del `<select>` del panel admin incluyen nombres de sala de hasta 23 caracteres ("Sala 4 - 2D Tradicional").
+- **Fix:** `sala VARCHAR(50)` en `database/init.sql` + `ALTER TABLE Funcion MODIFY sala VARCHAR(50) NOT NULL` aplicado en vivo en EC2-BDD (`10.0.40.200`). Verificado con `information_schema` (varchar(50)).
+- **Regla:** MySQL en modo strict rechaza valores más largos que el tipo de la columna ("Data too long"); al tocar esquema, alinear `init.sql` con `information_schema` y aplicar el ALTER en los entornos donde la tabla ya existe.
+
+### 15.11 Causa raíz real: Hibernate `ddl-auto: update` revierte el esquema (15/09/2026)
+
+- **Síntoma recurrente:** tras aplicar el ALTER (15.10) y verificar `varchar(50)`, la columna volvió a `varchar(20)` y el error "Data too long for column 'sala'" reapareció.
+- **Causa raíz (confirmada con binlog en EC2-BDD):** `spring.jpa.hibernate.ddl-auto: update` en movie-service y ticket-service. Cada vez que arranca un contenedor, Hibernate compara las entidades contra la BDD y ejecuta ALTERs; la entidad `Funcion.sala` tenía `@Column(length = 20)`, así que Hibernate emitía `alter table Funcion modify column sala varchar(20) not null` al desplegar movie-service, revirtiendo el fix. Los redeploys posteriores al ALTER lo deshicieron.
+- **Fix definitivo:**
+  - `movie-service/.../entity/Funcion.java`: `@Column(length = 20)` → `length = 50`.
+  - `application.yml` de movie-service y ticket-service: `ddl-auto: update` → `ddl-auto: none`. El esquema se gestiona SOLO vía `database/init.sql` + ALTERs manuales; Hibernate ya no muta la BDD.
+  - Re-aplicado `ALTER TABLE Funcion MODIFY sala VARCHAR(50) NOT NULL` y verificado `varchar(50)` (los contenedores ya no lo revierten).
+- **Lección:** `ddl-auto: update` es peligroso en producción: Hibernate puede encoger columnas según la metadata de las entidades. Con esquema centralizado en `init.sql`, usar `ddl-auto: none`. Ante síntomas que "vuelven solos", revisar binlog/general_log antes de suponer re-seed.
+
+### 15.12 Fix: recarga en `/admin` bloqueaba con "Acceso restringido" (15/09/2026)
+
+- **Síntoma:** estando logueado con una cuenta ADMIN, al recargar la página en `/admin` aparecía el alert "Acceso restringido: Se requiere rol de Administrador." y se redirigía a `/cartelera`, como si la sesión no se guardara.
+- **Causa:** `AdminGuard.canActivate()` y `AuthGuard.canActivate()` eran síncronos y corrían ANTES de que MSAL restaurara la sesión desde `localStorage` (evento `InteractionStatus.None`). En ese instante `currentUserSubject` estaba `null` → `isAdmin()` daba `false`. La sesión SÍ estaba persistida (MSAL), el guard no la esperaba. El rol ADMIN proviene del claim `roles` del token de Entra AD.
+- **Fix (frontend):**
+  - `AuthService.waitForAuthReady(): Promise<UserProfile|null>`: en Azure espera el primer `InteractionStatus.None` (`take(1)` + timeout 8s), llama `ensureActiveAccount()` (activa la primera cuenta si `getActiveAccount()` es nulo tras la recarga), `checkActiveAccount()` y `sincronizarPerfilConBFF()` (fuente de verdad del rol). En modo demo resuelve inmediato.
+  - `AdminGuard` y `AuthGuard` ahora son `async` y hacen `await authService.waitForAuthReady()` antes de evaluar roles/autenticación.
+- **Seguridad intacta:** la protección real está en el backend (`/api/admin/**` → `hasRole("ADMIN")` en `SecurityConfig`; roles leídos del claim `roles` del JWT por `JwtAuthConverter`). Usuarios CLIENTE o deslogueados siguen bloqueados por el guard al intentar `/admin`.
+
+## 16. NOTIFICACIONES ASÍNCRONAS: ESTADO REAL, FIXES Y EVIDENCIAS (14/10/2026)
+
+### 16.1 Diagnóstico: todo el Flujo 6 estaba implementado pero NO commiteado ni desplegado
+
+El sistema de notificaciones (§5 Flujo 6) existía **solo en el working tree local** de los 6 repos: cero commits, cero deploys. En producción no había campana, ni bandeja, ni administración.
+
+| Hallazgo | Efecto |
+| :--- | :--- |
+| `notification-service` **no tenía `.git`** y su repo GitHub no existía | `bootstrap-ec2.sh` **abortaba** (`REPOS` incluye `pasalapeli-notification-service` y `git clone` fallaba) |
+| `msal.config.ts` no incluía `/notificaciones**` en el `protectedResourceMap` | El `MsalInterceptor` no adjuntaba el Bearer → **401 silenciado** en Azure AD (la campana nunca funcionaba en prod) |
+| Contador de no leídas con sondeo `interval(30000)` | Demasiado lento para "tiempo real" |
+| `deploy.yml` de notification hacía `git pull` a un directorio inexistente | El pipeline habría fallado en EC2-APPS |
+| Código de mensajería (movie/ticket/bff/database/frontend) sin commit | Riesgo de pérdida y sin historial |
+
+### 16.2 Cambios de esta sesión
+
+| Repo | Contenido |
+| :--- | :--- |
+| `pasalapeli-notification-service` | **Primera versión en git**: API bandeja/contador/admin, `RabbitConfig`, consumidores + DLQ, validación de regla duplicada (400, `BusinessException`), `deploy.yml` con clonado condicional. Segundo commit: fix del `DeadLetterConsumer` (factory sin conversor JSON) |
+| `pasalapeli-frontend` | Campana + bandeja + `admin-mensajeria`, `/notificaciones**` en el `protectedResourceMap`, sondeo 30s → 10s, `console.warn` |
+| `pasalapeli-bff-service` | `NotificationClient`, `NotificationBffController`, `AdminNotificacionBffController`, rutas en `SecurityConfig` |
+| `pasalapeli-movie-service` | `RabbitProducerConfig`, `NotificacionEventPublisher` (`AFTER_COMMIT` best-effort), evento `PELICULA_CREADA` |
+| `pasalapeli-ticket-service` | Igual que movie para `TICKET_PAGADO` y `TICKET_DEVUELTO` |
+| `pasalapeli-database` | `init.sql` tablas 6-9 + seeds, `docker-compose.yml` con RabbitMQ, bootstrap relay de `RABBITMQ_DEFAULT_*` |
+
+### 16.3 Topología RabbitMQ (configuración centralizada)
+
+- **Exchange** `pasalapeli.events` (topic, durable) — **routing keys**: `pelicula.creada`, `ticket.pagado`, `ticket.devuelto` (fallback `evento.generico`).
+- **Cola principal** `pasalapeli.notificaciones.queue` con bindings `pelicula.*` y `ticket.*`.
+- **DLX** `pasalapeli.dlx` (direct) → **DLQ** `pasalapeli.notificaciones.dlq` vía `x-dead-letter-*` declarados en la cola principal.
+- **Reintentos:** `max-attempts: 3` + `default-requeue-rejected: false` (notification-service) → agotados, a la DLQ y a la tabla `MensajeFallido`.
+- **Desacoplamiento:** `TypePrecedence.INFERRED` → productores y consumidor **no comparten clases** de evento (solo JSON).
+- **Best-effort:** `@TransactionalEventListener(AFTER_COMMIT, fallbackExecution = true)` con try/catch: un fallo del broker **no rompe** la operación de negocio (solo se loguea).
+- **Secretos:** en producción las credenciales viven en GitHub Secrets y se reparten por el `.env` de EC2-APPS; en `application.yml` solo hay defaults de desarrollo (`pasalapeli123`) con override por variable de entorno.
+
+### 16.4 Verificación E2E en producción (15/10/2026)
+
+- **Pipelines:** los 6 repos desplegados con workflows verdes (bootstrap 4m23s; notification 3m40s; movie 1m26s; ticket 4m40s; bff 2m27s; frontend 1m23s). Los 5 contenedores de EC2-APPS quedaron `healthy`.
+- **Migración de esquema:** el bootstrap **NO** ejecuta `init.sql` (la BDD externa de EC2-BDD ya existía con solo 5 tablas). Se aplicó una migración incremental con las tablas 6-9 + seeds (`Notificacion`, `DestinoNotificacion`, `ReglaDistribucion`, `MensajeFallido`): script en `/tmp/mig-notif.sql` (contenido = secciones 6-9 y seeds de destinos/reglas de `init.sql`, idempotente con `CREATE TABLE IF NOT EXISTS`).
+- **E2E mensaje de prueba (pelicula):** publicado `PELICULA_CREADA` al exchange → `routed:true`, cola procesó al instante (0 mensajes), **6 notificaciones** persistidas (una por cada usuario registrado, destino `TODOS`), título "Nueva pelicula en cartelera", `leida=0`. Log: `Evento PELICULA_CREADA procesado: 6 notificacion(es) generada(s)`.
+- **E2E DLQ (hallazgo + fix):** un payload no-JSON fue a la DLQ, **pero el `DeadLetterConsumer` fallaba** porque Spring AMQP le aplicaba el conversor Jackson antes de invocarlo → `JsonParseException` dentro del propio consumidor → nunca registraba en `MensajeFallido` (el mensaje se perdía). **Fix (notification):** nuevo bean `dlqListenerFactory` (`SimpleRabbitListenerContainerFactory` con `SimpleMessageConverter`, sin JSON) y `@RabbitListener(containerFactory = "dlqListenerFactory")` en `DeadLetterConsumer`. Re-verificado: fila en `MensajeFallido` (payload crudo, `error=rejected`, `intentos=1`) + log `Mensaje fallido registrado [id=1]`.
+- **Estado RabbitMQ:** cola principal y DLQ, ambas con 1 consumer conectado y 0 mensajes pendientes.
+
+### 16.5 Evidencias
+
+Mapeo de requisito → archivo que lo respalda: config central de mensajería → `RabbitConfig.java`; destinos/reglas + mensajes de prueba → `init.sql` seeds + `DestinoService`/`ReglaService`; separación de negocio de mensajería → `NotificacionEventPublisher`; consumidores por responsabilidad → `NotificacionConsumer` + `DeadLetterConsumer`; ack/reintentos/fallidos → DLQ + `MensajeFallidoService`; admin, CRUD encapsulado y validación → `AdminNotificacionController` + `DestinoService`/`ReglaService`.
+
+### 16.6 Para agentes futuros
+
+- **Nunca** commitear sin verificar `git status` en los 6 repos: el trabajo previo de mensajería vivió meses sin commitear.
+- El `protectedResourceMap` del frontend debe listar **cada** endpoint del BFF; si se agrega un prefijo nuevo bajo `/api/`, revisar `msal.config.ts` (si no, en Azure AD será un 401 silencioso).
+- `bootstrap-ec2.sh` clona los 6 repos con `set -e`: si falta alguno en GitHub, **todo** el bootstrap falla. Crear el repo antes de empujar `database`.
+- `notification-service` ahora sí tiene `.git` y su `deploy.yml` clona el repo si no existe en el servidor (primera vez).
