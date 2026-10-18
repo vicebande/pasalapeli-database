@@ -12,6 +12,8 @@
 #   REPO_OWNER        (usuario/org de GitHub que contiene los repos)
 #   DOMAIN            (dominio publico, ej. peli.midominio.cl) opcional
 #   CERTBOT_EMAIL     (email para Let's Encrypt) opcional
+#   EC2_APPS_HOST     (IP privada de EC2-APPS, desde vars de GitHub) opcional
+#   APP_BASE_URL      (URL base del frontend, desde vars de GitHub) opcional
 # ============================================================
 set -euo pipefail
 
@@ -19,8 +21,22 @@ APP_DIR="/opt/pasalapeli"
 REPO_OWNER="${REPO_OWNER:-}"
 DOMAIN="${DOMAIN:-}"
 CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
+EC2_APPS_HOST="${EC2_APPS_HOST:-}"
+APP_BASE_URL="${APP_BASE_URL:-}"
 
 log() { echo "==> $*"; }
+
+# Upsert KEY=VALUE en .env (sin duplicar). Asi la config vive en las
+# Variables de GitHub y viaja aqui; no se edita el .env a mano en la EC2.
+env_upsert() {
+  local file="$1" key="$2" val="$3"
+  [[ -z "$val" ]] && return 0
+  if grep -q "^${key}=" "$file" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "$file"
+  fi
+}
 
 log "Instalando dependencias del sistema"
 export DEBIAN_FRONTEND=noninteractive
@@ -80,6 +96,15 @@ if [[ ! -s "$CERT_DIR/fullchain.pem" ]]; then
       -subj "/CN=localhost"
   fi
 fi
+# nginx corre como uid 101 (unprivileged): necesita lectura world en los certs
 sudo chown -R "$(whoami)" "$CERT_DIR"
+sudo chmod 644 "$CERT_DIR/fullchain.pem" "$CERT_DIR/privkey.pem"
+
+ENV_FILE="$APP_DIR/pasalapeli-database/.env"
+log "Escribiendo config de GitHub en .env (EC2_APPS_HOST/APP_BASE_URL)"
+[[ -f "$ENV_FILE" ]] || touch "$ENV_FILE"
+env_upsert "$ENV_FILE" EC2_APPS_HOST "$EC2_APPS_HOST"
+env_upsert "$ENV_FILE" APP_BASE_URL "$APP_BASE_URL"
+grep -E '^(EC2_APPS_HOST|APP_BASE_URL)=' "$ENV_FILE" || true
 
 log "Bootstrap de EC2-WEB finalizado."
