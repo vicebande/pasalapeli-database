@@ -907,3 +907,61 @@ Mapeo de requisito → archivo que lo respalda: config central de mensajería �
 - El `protectedResourceMap` del frontend debe listar **cada** endpoint del BFF; si se agrega un prefijo nuevo bajo `/api/`, revisar `msal.config.ts` (si no, en Azure AD será un 401 silencioso).
 - `bootstrap-ec2.sh` clona los 6 repos con `set -e`: si falta alguno en GitHub, **todo** el bootstrap falla. Crear el repo antes de empujar `database`.
 - `notification-service` ahora sí tiene `.git` y su `deploy.yml` clona el repo si no existe en el servidor (primera vez).
+
+## 17. REVISIÓN INTEGRAL + SEGURIDAD + NUEVA UI "PASSLINE" (18/10/2026)
+
+Sesión de revisión completa del proyecto (código, seguridad, UX y visual) sin cambiar la idea principal. Los 6 repos quedaron en `main` con SonarQube Cloud verde y deploys verificados en producción.
+
+### 17.1 Decisiones del usuario (no repetir sin preguntar)
+
+1. **No subir frameworks**: Angular 18.2.14 y Spring Boot 3.3.11 se quedan como están.
+2. **3 fixes de seguridad backend** (Azure fail-closed, token interno, puerto 8084 fuera del compose).
+3. **Deploys 1 a 1**: los workflows se serializan con `flock -x -w 1800 /tmp/pasalapeli-deploy.lock`; nunca empujar los 6 repos en paralelo.
+4. **Paleta Passline con acento ámbar `#FFB700` y alcance = todo el sitio** (elegido explícitamente por el usuario).
+5. **El usuario usa Firefox, no Chrome.**
+
+### 17.2 Fase A — Seguridad backend (commits: database `ea46e7f`, movie `3e1d997`, ticket `4148a2a`, notification `86b7913`, bff `1836298`)
+
+- `AZURE_AUTH_ENABLED` **fail-closed** en compose/bootstrap/.env.example + `warnIfDemoMode()` en los 4 `SecurityConfig` (si Azure está deshabilitado, se loguea WARN claro de modo demo).
+- **`InternalApiTokenFilter`** + header `X-Internal-Token` en `MovieServiceClient`: BFF → movie (`/descontar`, `/reponer`) autenticado con `INTERNAL_API_TOKEN`.
+- Puerto **8084 fuera del `docker-compose.yml`** (solo expuesto en local).
+- `FilterPolicy` con evento `PELICULA_ELIMINADA`; código de ticket de 12 hex; **ownership de tickets** en `TicketController`; encoding con `UriComponentsBuilder...encode().toUri()` (fix del doble `%2520`); `show-sql`/`show-details` por variable de entorno; **`PUT /api/admin/movies/{id}`** en `AdminBffController`.
+
+### 17.3 Fase B — Frontend: UX admin, responsive y durabilidad
+
+- Admin reescrito: **N+1 eliminado** (funciones embebidas en `GET /api/cartelera?todas=true`), modales con validación `ngForm`, vista tarjetas en móvil.
+- Navbar hamburguesa responsive; términos en `localStorage`; gate `X-Dev-User-*` solo local; guards sin `alert()`.
+- `nginx.conf`: **CSP/HSTS/Permissions-Policy**; `npm ci` en CI; `@angular/animations` fuera del bundle.
+
+### 17.4 Fase C — CSP fix en producción (commit frontend `d4a8e7c`)
+
+CSP final verificada en prod con Firefox (0 violaciones, FontAwesome carga, 8/8 portadas):
+- `style-src` incluye **cdnjs** (CSS inline de FA), `img-src` incluye **`https://*.amazonaws.com`** (el backend devuelve **302 presignado S3** para `/uploads/…`), y `script-src` incluye `'unsafe-hashes'` + `sha256-MhtPZXr7+LpJUY5qtMutB+qWfQtMaPccfe7QXtCcEYc=` (handler `this.media='all'` de Angular esbuild).
+
+### 17.5 Fase D — UI Passline (commit frontend `6701938`)
+
+Paleta nueva en `styles.css` (`:root`), tomada del CSS real de Passline: `--bg-main #21222B`, `--bg-card #292B36`, `--bg-card-hover #343744`, `--bg-elevated #2F3140`, `--border-color #3C4154`, `--border-color-hover #4D5165`, `--accent #FFB700`, `--accent-hover #FFC533`, `--accent-strong #CC9200`, `--text-secondary #adb5bd`, `--success #198754`, `--warning #FFC509`, `--danger #F64444`.
+
+- Botones primarios **sólidos ámbar con texto carbón** (`#21222B`); rojo `#F64444` solo destructivos; focus ring ámbar.
+- Se eliminaron `--accent-red`/`--accent-blue` (renombrados a `--accent*` en todos los `*.css`).
+- **Iconos decorativos** `text-red`/`text-blue` → `text-accent` en todos los HTML (el rojo queda solo para eliminar/agotado).
+- Nuevo **`.badge-neutral`**: género, duración y rol Cliente ahora son neutros; `badge-red` solo para agotado/destructivo, `badge-green` para cupos, `badge-gold` para ADMIN.
+- **Fix tabla admin**: se quitó `max-height: 560px` de `.table-responsive` (cortaba filas a media altura y se veía roto).
+- **Fix navbar 1280**: gaps finos + `margin-left: auto` en `.navbar-actions` (con "Panel Admin" + caja de Modo Prueba el menú se partía; en prod con Azure no ocurre porque no hay caja de prueba).
+- **Fix móvil**: hero con padding reducido <480px (el input de búsqueda quedaba a 116px).
+
+### 17.6 Verificación (QA local + producción)
+
+- **QA local con mock** en `/tmp/opencode/adminqa/`: `mock-api.mjs` (puerto 8080, **rutas reales `/api/admin/*`**, `/api/cartelera`, `/api/tickets`, `/api/notificaciones`) + `serve.mjs` (4200) sobre `dist/` y scripts Playwright con **`firefox.launch()`**. Capturas en `/tmp/opencode/qa-*.png`: cartelera 1280/360, detalle, modal de compra, admin 1280/768/360, mis-tickets — **0 errores de consola**.
+- **Producción** (`https://ec2-100-63-21-68.compute-1.amazonaws.com`): `btn-primary` = `rgb(255, 183, 0)`, hero con gradiente carbón, **8/8 pósters** (S3 presignado), FontAwesome OK, **0 errores/CSP**. Commit `6701938` desplegado (run 39110326939, success).
+
+### 17.7 Para agentes futuros
+
+- **Firefox**: el MCP Playwright exige `/opt/google/chrome/chrome` y en esta máquina no hay Chrome → usar scripts node con `playwright` + `firefox.launch()` (Firefox ya instalado en `~/.cache/ms-playwright/firefox-1555`).
+- **`pkill -f "<patrón>"` mata el propio shell** si el patrón aparece en la línea de comando (mató 2 sesiones): usar `pgrep` y matar por PID, o `setsid node … &`.
+- **QA de `/admin` solo local**: en producción Azure está habilitado y `/admin` exige login Microsoft sin credenciales de prueba.
+- El mock debe servir **`/api/admin/destinos|reglas|mensajes-fallidos|anuncios|movies|funciones`** (`admin.service.ts` usa `${apiBaseUrl}/admin`) y **`/api/notificaciones?page=&size=`** (no `/usuario/{id}`).
+- En `/admin` las vistas se controlan con `.movie-cards.mobile-only` (un `display:flex` posterior ganaba a `display:none` por misma especificidad → tarjetas duplicadas en desktop).
+- El navbar desktop usa `.navbar-menu { display: contents }`: los hijos (nav + acciones) son items directos del flex del container.
+- `/admin` en desktop muestra la tabla (`.table-desktop`), en ≤900px las tarjetas (`.movie-cards`).
+- Para revisar visualmente: `npx ng build --configuration development` + mock + serve local; el **toggle "Modo Prueba"** cambia a ADMIN (el estado no sobrevive `page.goto`, hay que clickear `a[href="/admin"]` en la sesión ya abierta).
