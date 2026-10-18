@@ -111,7 +111,7 @@ aws sns set-subscription-attributes \
 aws sns set-subscription-attributes \
   --subscription-arn "$SUB_ARN" \
   --attribute-name FilterPolicy \
-  --attribute-value '{"tipo":["PELICULA_CREADA","TICKET_PAGADO","TICKET_DEVUELTO"]}' \
+  --attribute-value '{"tipo":["PELICULA_CREADA","PELICULA_ELIMINADA","TICKET_PAGADO","TICKET_DEVUELTO"]}' \
   --region "$REGION"
 
 # ------------------------------------------------------------
