@@ -7,5 +7,5 @@ variable "environment_name" {
 variable "domain_name" {
   description = "Dominio de la aplicación"
   type        = string
-  default     = "$repo"
+  default     = "pasalapeli-database"
 }

@@ -25,11 +25,12 @@ resource "aws_sns_topic_subscription" "events_sqs" {
   endpoint  = aws_sqs_queue.events.arn
 }
 
-# Kinesis Stream for metrics
+# Kinesis Stream for metrics (retention default 24h, sin IncreaseStreamRetentionPeriod
+# para evitar denegación por SCP de la organización)
 resource "aws_kinesis_stream" "metrics" {
   name             = "pasalapeli-metrics-stream"
   shard_count      = 1
-  retention_period = 24 # hours
+  retention_period = 24
 
   tags = {
     Environment = var.environment_name

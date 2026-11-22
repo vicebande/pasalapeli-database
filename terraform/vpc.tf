@@ -14,6 +14,7 @@ data "aws_subnets" "private" {
   }
 }
 
+# VPC
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
@@ -25,6 +26,7 @@ resource "aws_vpc" "main" {
   }
 }
 
+# Internet Gateway
 resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.main.id
 
@@ -53,7 +55,7 @@ resource "aws_subnet" "public" {
 resource "aws_subnet" "private" {
   count                   = 2
   vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.1.${count.index + 1}.0/24"
+  cidr_block              = "10.2.${count.index + 1}.0/24"
   availability_zone       = data.aws_availability_zones.available.names[count.index]
   map_public_ip_on_launch = false
 
@@ -64,6 +66,7 @@ resource "aws_subnet" "private" {
   }
 }
 
+# EIP for NAT Gateway
 resource "aws_eip" "nat" {
   tags = {
     Environment = var.environment_name
@@ -71,6 +74,7 @@ resource "aws_eip" "nat" {
   }
 }
 
+# NAT Gateway
 resource "aws_nat_gateway" "nat" {
   allocation_id = aws_eip.nat.id
   subnet_id     = aws_subnet.public[0].id
@@ -81,6 +85,7 @@ resource "aws_nat_gateway" "nat" {
   }
 }
 
+# Route tables
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
 
@@ -122,7 +127,10 @@ resource "aws_route" "nat" {
   nat_gateway_id         = aws_nat_gateway.nat.id
 }
 
-# Security Groups
+# ============================================================
+# SECURITY GROUPS
+# ============================================================
+
 resource "aws_security_group" "frontend" {
   name        = "pasalapeli-frontend-sg"
   description = "Security group for frontend ALB"
@@ -168,10 +176,17 @@ resource "aws_security_group" "backend" {
   }
 
   ingress {
+    from_port       = 8082
+    to_port         = 8082
+    protocol        = "tcp"
+    security_groups = [aws_security_group.frontend.id]
+  }
+
+  ingress {
     from_port   = 3306
     to_port     = 3306
     protocol    = "tcp"
-    cidr_blocks = ["10.1.0.0/16"]
+    cidr_blocks = ["10.2.0.0/16"]
   }
 
   egress {
@@ -221,7 +236,7 @@ resource "aws_security_group" "eks" {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["10.0.0.0/16", "10.1.0.0/16"]
+    cidr_blocks = ["10.0.0.0/16", "10.2.0.0/16"]
   }
 
   egress {
