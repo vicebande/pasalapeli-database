@@ -1,64 +1,39 @@
-# pasalapeli-database (Orquestador)
+# pasalapeli-database (Infraestructura compartida AWS)
 
-Repositorio orquestador de **Pasa La Peli**. Contiene:
+Repositorio propietario de la **infraestructura compartida** de Pasa La Peli en AWS (Cloud Native). Despliega, vía Terraform + GitHub Actions:
 
-- `docker-compose.yml` — stack backend para **EC2-APPS**: `movie`, `ticket`, `notification` y `bff` (mensajería vía AWS SNS/SQS)
-- `docker-compose.web.yml` — stack para **EC2-WEB**: solo el `frontend` (nginx + HTTPS)
-- `init.sql` — script de creación de la base de datos `pasalapeli_db` (9 tablas: Usuario, Pelicula, Funcion, Ticket, Pago, Notificacion, DestinoNotificacion, ReglaDistribucion, MensajeFallido) con datos de prueba
-- `migrations/002-parches.sql` — migración idempotente de los parches de auditoría (aforo, idempotency_key, UNIQUEs). `bootstrap-ec2.sh` la aplica automáticamente en cada bootstrap (antes de levantar el stack); también puede ejecutarse manualmente contra la BDD.
-- `scripts/bootstrap-ec2.sh` — setup completo de EC2 desde cero (Docker, repos, certificados, deploy)
-- `scripts/renew-certs.sh` — renovación automática de certificados Let's Encrypt
-- `scripts/setup-messaging.sh` — crea topic SNS, cola SQS, DLQ y suscripción con FilterPolicy (idempotente, solo requiere AWS CLI)
-- `.env.example` — plantilla de variables de entorno
+- **VPC**: `10.0.0.0/16`, 2 subnets públicas (frontend/ALB) + 2 subnets privadas (backend/BBDD), Internet Gateway, NAT Gateway, route tables.
+- **Security Groups**: `frontend-sg` (HTTP/HTTPS 0.0.0.0/0), `backend-sg` (desde frontend SG + MySQL desde privadas), `db-sg` (desde backend SG en 3306), `eks-sg` (cluster EKS).
+- **EKS Cluster**: `pasalapeli-cluster` (K8s 1.28, endpoint privado, logging de control plane habilitado, node group `pasalapeli-workers` en subnets privadas).
+- **ECR Repository**: `pasalapeli-images` (imágenes Docker de todos los microservicios, escaneo en push, tags inmutables).
+- **RDS MySQL 8.0**: `pasalapeli-db` (db.t3.micro, subnets privadas, SG aislado, cifrado, backup 7 días, password generado aleatoriamente).
+- **S3**: `pasalapeli-tfstate` (estado Terraform, versionado + cifrado), `pasalapeli-website-static`, `pasalapeli-uploads`.
+- **SNS + SQS**: topic `pasalapeli-events`, cola `pasalapeli-events-queue` (24h retención) con suscripción SQS→SNS.
+- **Kinesis**: `pasalapeli-metrics-stream` (1 shard, 24h retención).
 
-## Despliegue con GitHub Actions
+## Despliegue CI/CD (GitHub Actions → Terraform → EKS)
 
-### Prerequisitos
+Este repo **se despliega primero** (crea el bucket de estado de Terraform y el cluster EKS que los demás servicios consumen).
 
-1. Crear la instancia **EC2 Ubuntu 24.04** con Security Group que abra los puertos **22, 80, 443**.
-2. Registrar los **GitHub Secrets** en este repo:
+Workflow `.github/workflows/deploy.yml` en cada `push` a `main`:
+1. Quality Gate: SonarCloud (bloquea si falla).
+2. Terraform Init: backend S3 `pasalapeli-tfstate` (`pasalapeli-database/terraform.tfstate`).
+3. Terraform Format / Validate / Plan.
+4. Terraform Apply (`-auto-approve`, solo en `main`).
 
+### GitHub Secrets requeridos
 | Secret | Descripción |
 |---|---|
-| `EC2_HOST` | IP pública del EC2 |
-| `EC2_USER` | Usuario SSH (usualmente `ubuntu`) |
-| `EC2_SSH_KEY` | Clave privada SSH (.pem) |
+| `AWS_ACCESS_KEY_ID` | Credencial AWS con permisos sobre EKS, RDS, S3, IAM, ECR, SNS, SQS, Kinesis |
+| `AWS_SECRET_ACCESS_KEY` | Secreto asociado |
+| `AWS_SESSION_TOKEN` | Token de sesión (si se usan credenciales temporales STS) |
+| `SONAR_TOKEN` | Token de SonarCloud |
+| `SONAR_HOST_URL` | `https://sonarcloud.io` |
 
-3. Registrar las **GitHub Variables** (Settings → Variables → Actions):
+### Orden de despliegue recomendado
+1. `pasalapeli-database` (infra compartida — **primero**)
+2. Los demás servicios (`frontend`, `movie-service`, `notification-service`, `bff-service`, `ticket-service`) en cualquier orden.
 
-| Variable | Descripción |
-|---|---|
-| `EC2_DOMAIN` | Dominio apuntando al EC2 (ej. `peli.midominio.cl`) |
-| `CERTBOT_EMAIL` | Email para certificados Let's Encrypt |
-| `AWS_REGION` | Región AWS (por defecto `us-east-1`) |
-| `SNS_TOPIC_ARN` | ARN del topic SNS (salida de `scripts/setup-messaging.sh`) |
-| `SQS_QUEUE_URL` | URL de la cola SQS de notificaciones (salida de `scripts/setup-messaging.sh`) |
-| `SQS_DLQ_URL` | URL de la DLQ (salida de `scripts/setup-messaging.sh`) |
-
-> El EC2-APPS necesita un **instance profile** (ej. `LabInstanceProfile`) para
-> que los contenedores obtengan credenciales vía IMDS y puedan publicar en SNS
-> / consumir de SQS.
-
-### Primer despliegue (bootstrap)
-
-1. Clonar localmente este repositorio
-2. Copiar `.env.example` como `.env` y ajustar las variables
-3. Hacer `git push` a `main` → el workflow `bootstrap.yml` ejecuta todo en el EC2
-4. Verificar: `ssh ubuntu@EC2 "docker compose -f /opt/pasalapeli/pasalapeli-database/docker-compose.yml ps"`
-
-### Desarrollo local
-
-```bash
-# Solo MySQL (la BDD en producción es EC2-BDD nativo, no contenedor):
-docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=pasalapeli_db mysql:8
-
-# Mensajeria asincrona (AWS SNS/SQS): crea topic, cola, DLQ y suscripcion.
-# Requiere AWS CLI con credenciales (o un LocalStack/SNS simulado en local).
-./scripts/setup-messaging.sh
-
-# Stack completo en EC2-APPS (requiere que los repos hermanos existan como dirs ../pasalapeli-*)
-docker compose up -d --build
-
-# Frontend en EC2-WEB
-docker compose -f docker-compose.web.yml up -d --build
-```
+### Variables de entorno (terraform)
+- `TF_VAR_environment_name` = `dev` (por defecto)
+- `TF_VAR_domain_name` = `pasalapeli-database`
