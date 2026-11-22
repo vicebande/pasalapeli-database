@@ -1,0 +1,57 @@
+name: Deploy pasalapeli-database (infra) a EKS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  quality:
+    name: Quality Gate (SonarQube Cloud)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Analizar y esperar al Quality Gate (bloquea el deploy)
+        uses: SonarSource/sonarqube-scan-action@v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: -Dsonar.qualitygate.wait=true
+
+  terraform:
+    name: Terraform Infrastructure
+    needs: quality
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      TF_VAR_environment_name: dev
+      TF_VAR_domain_name: pasalapeli-database
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Terraform Format
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init -backend=true -backend-config="bucket=pasalapeli-tfstate" -backend-config="key=pasalapeli-database/terraform.tfstate" -backend-config="region=us-east-1" -input=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -no-color
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve

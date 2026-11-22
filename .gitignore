@@ -12,3 +12,7 @@ Thumbs.db
 # No commitear claves SSH
 *.pem
 *.key
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
