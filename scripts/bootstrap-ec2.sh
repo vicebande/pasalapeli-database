@@ -96,6 +96,10 @@ AWS_REGION=${AWS_REGION:-us-east-1}
 SNS_TOPIC_ARN=${SNS_TOPIC_ARN:-}
 SQS_QUEUE_URL=${SQS_QUEUE_URL:-}
 SQS_DLQ_URL=${SQS_DLQ_URL:-}
+
+# --- Streaming: metricas de ventas + logs de seguridad blue-team (Kinesis) ---
+KINESIS_STREAM_VENTAS=${KINESIS_STREAM_VENTAS:-stream-ventas}
+KINESIS_STREAM_SECURITY_LOGS=${KINESIS_STREAM_SECURITY_LOGS:-stream-security-logs}
 EOF
   chmod 600 "$ENV_FILE"
 fi

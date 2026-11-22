@@ -48,6 +48,8 @@ services:
       # Mensajeria asincrona (AWS SNS); credenciales via IMDS/LabRole
       AWS_REGION: ${AWS_REGION:-us-east-1}
       SNS_TOPIC_ARN: ${SNS_TOPIC_ARN:-}
+      # Metricas de negocio en tiempo real (Kinesis Data Streams)
+      KINESIS_STREAM_VENTAS: ${KINESIS_STREAM_VENTAS:-stream-ventas}
       # Token interno para llamar a movie-service /descontar|/reponer
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-dev-internal-token}
     depends_on:
@@ -100,6 +102,10 @@ services:
       TICKET_SERVICE_URL: http://ticket-service:8083
       NOTIFICATION_SERVICE_URL: http://notification-service:8084
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}
+      # Dashboard de metricas en tiempo real + SIEM blue-team (Kinesis)
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      KINESIS_STREAM_VENTAS: ${KINESIS_STREAM_VENTAS:-stream-ventas}
+      KINESIS_STREAM_SECURITY_LOGS: ${KINESIS_STREAM_SECURITY_LOGS:-stream-security-logs}
     ports:
       - "8080:8080"
     depends_on:

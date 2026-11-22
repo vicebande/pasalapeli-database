@@ -1,0 +1,74 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Pasa La Peli - Flujos de Amazon Kinesis Data Streams (modo On-Demand).
+  stream-ventas         : metricas de negocio en tiempo real (ventas completadas).
+  stream-security-logs  : logs de seguridad blue-team / SIEM (401, 403, peticiones sospechosas).
+
+Parameters:
+  StreamMode:
+    Type: String
+    Default: ON_DEMAND
+    AllowedValues:
+      - ON_DEMAND
+      - PROVISIONED
+    Description: Modo de capacidad de los streams (On-Demand para laboratorio/desarrollo).
+
+  RetentionPeriodHours:
+    Type: Number
+    Default: 24
+    MinValue: 24
+    MaxValue: 8760
+    Description: Retencion de los registros en el stream (horas).
+
+Resources:
+  StreamVentas:
+    Type: AWS::Kinesis::Stream
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: stream-ventas
+      RetentionPeriodHours: !Ref RetentionPeriodHours
+      StreamModeDetails:
+        StreamMode: !Ref StreamMode
+      Tags:
+        - Key: Proyecto
+          Value: pasalapeli
+        - Key: Finalidad
+          Value: metricas-ventas
+
+  StreamSecurityLogs:
+    Type: AWS::Kinesis::Stream
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: stream-security-logs
+      RetentionPeriodHours: !Ref RetentionPeriodHours
+      StreamModeDetails:
+        StreamMode: !Ref StreamMode
+      Tags:
+        - Key: Proyecto
+          Value: pasalapeli
+        - Key: Finalidad
+          Value: blueteam-siem
+
+Outputs:
+  StreamVentasArn:
+    Description: ARN del stream de ventas.
+    Value: !GetAtt StreamVentas.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-StreamVentasArn
+  StreamVentasName:
+    Description: Nombre del stream de ventas.
+    Value: !Ref StreamVentas
+    Export:
+      Name: !Sub ${AWS::StackName}-StreamVentasName
+  StreamSecurityLogsArn:
+    Description: ARN del stream de logs de seguridad.
+    Value: !GetAtt StreamSecurityLogs.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-StreamSecurityLogsArn
+  StreamSecurityLogsName:
+    Description: Nombre del stream de logs de seguridad.
+    Value: !Ref StreamSecurityLogs
+    Export:
+      Name: !Sub ${AWS::StackName}-StreamSecurityLogsName

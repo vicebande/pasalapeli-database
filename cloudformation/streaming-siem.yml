@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Pasa La Peli - Stack SIEM Blue Team:
+  dominio Amazon OpenSearch Service (t3.small.search, laboratorio),
+  Amazon Data Firehose desde stream-security-logs hacia el indice blueteam-logs-*,
+  respaldo de errores en S3 y rol IAM con privilegio minimo.
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: pasalapeli-blueteam
+    AllowedPattern: '[a-z0-9-]+'
+    Description: Nombre del dominio OpenSearch.
+
+  OpenSearchInstanceType:
+    Type: String
+    Default: t3.small.search
+    AllowedValues:
+      - t3.small.search
+      - t3.medium.search
+      - m3.small.search
+    Description: Tipo de instancia OpenSearch (solo laboratorio).
+
+  FirehoseStreamName:
+    Type: String
+    Default: blueteam-firehose
+    AllowedPattern: '[a-zA-Z0-9._-]+'
+    Description: Nombre del delivery stream de Firehose.
+
+  SourceStreamName:
+    Type: String
+    Default: stream-security-logs
+    Description: Stream Kinesis de origen (logs de seguridad).
+
+  IndexName:
+    Type: String
+    Default: blueteam-logs
+    AllowedPattern: '[a-z0-9-]+'
+    Description: >
+      Prefijo del indice OpenSearch. Con rotacion diaria los indices reales
+      son <IndexName>-AAAA-MM-DD, es decir cumplen el patron <IndexName>-*.
+
+Resources:
+  # --------------------------------------------------------------------------
+  # Bucket de respaldo para documentos que Firehose no puede entregar a
+  # OpenSearch (S3BackupMode = FailedDocumentsOnly).
+  # --------------------------------------------------------------------------
+  ErrorBackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub pasalapeli-blueteam-backup-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Proyecto
+          Value: pasalapeli
+
+  # --------------------------------------------------------------------------
+  # Rol IAM privilegio minimo: leer el stream de logs, escribir en OpenSearch
+  # y respaldar errores en S3.
+  # --------------------------------------------------------------------------
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub pasalapeli-firehose-role-${AWS::AccountId}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: pasalapeli-firehose-minimo
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Lectura del stream Kinesis origen
+              - Sid: LeerStreamOrigen
+                Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:ListShards
+                  - kinesis:ListStreams
+                Resource: !Sub arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${SourceStreamName}
+              # Escritura en el dominio OpenSearch (indice blueteam-logs-*)
+              - Sid: EscribirEnOpenSearch
+                Effect: Allow
+                Action:
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                  - es:ESHttpGet
+                  - es:ESHttpHead
+                Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}/*
+              # Respaldo de errores en S3
+              - Sid: RespaldoErroresS3
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt ErrorBackupBucket.Arn
+                  - !Sub ${ErrorBackupBucket.Arn}/*
+      Tags:
+        - Key: Proyecto
+          Value: pasalapeli
+
+  # --------------------------------------------------------------------------
+  # Dominio OpenSearch para laboratorio (1 instancia t3.small.search).
+  # --------------------------------------------------------------------------
+  BlueteamDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Ref DomainName
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: 1
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 10
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: Policy-Min-TLS-1-2-2019-07
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: FirehoseEscribe
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt FirehoseRole.Arn
+            Action:
+              - es:ESHttpPost
+              - es:ESHttpPut
+              - es:ESHttpGet
+              - es:ESHttpHead
+            Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}/*
+          - Sid: CuentaConsulta
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: es:ESHttpGet
+            Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}/*
+      Tags:
+        - Key: Proyecto
+          Value: pasalapeli
+        - Key: Finalidad
+          Value: blueteam-siem
+
+  # --------------------------------------------------------------------------
+  # Firehose: stream-security-logs -> OpenSearch (indice con rotacion diaria)
+  # con respaldo de errores en S3.
+  # --------------------------------------------------------------------------
+  BlueteamFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Ref FirehoseStreamName
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !Sub arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${SourceStreamName}
+        RoleARN: !GetAtt FirehoseRole.Arn
+      AmazonopensearchserviceDestinationConfiguration:
+        DomainARN: !GetAtt BlueteamDomain.DomainArn
+        IndexName: !Ref IndexName
+        IndexRotationPeriod: OneDay
+        TypeName: _doc
+        RetryOptions:
+          DurationInSeconds: 300
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 1
+        S3BackupMode: FailedDocumentsOnly
+        RoleARN: !GetAtt FirehoseRole.Arn
+        S3Configuration:
+          BucketARN: !GetAtt ErrorBackupBucket.Arn
+          RoleARN: !GetAtt FirehoseRole.Arn
+          Prefix: errores/
+          CompressionFormat: GZIP
+      Tags:
+        - Key: Proyecto
+          Value: pasalapeli
+
+Outputs:
+  DomainEndpoint:
+    Description: Endpoint HTTPS del dominio OpenSearch (para Kibana/consultas).
+    Value: !Sub https://${BlueteamDomain.DomainEndpoint}
+    Export:
+      Name: !Sub ${AWS::StackName}-DomainEndpoint
+  DomainArn:
+    Description: ARN del dominio OpenSearch.
+    Value: !GetAtt BlueteamDomain.DomainArn
+    Export:
+      Name: !Sub ${AWS::StackName}-DomainArn
+  FirehoseName:
+    Description: Nombre del delivery stream de Firehose.
+    Value: !Ref BlueteamFirehose
+    Export:
+      Name: !Sub ${AWS::StackName}-FirehoseName
+  FirehoseArn:
+    Description: ARN del delivery stream de Firehose.
+    Value: !GetAtt BlueteamFirehose.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-FirehoseArn
+  ErrorBackupBucketName:
+    Description: Bucket S3 de respaldo de errores de entrega.
+    Value: !Ref ErrorBackupBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-ErrorBackupBucket
+  FirehoseRoleArn:
+    Description: ARN del rol IAM usado por Firehose.
+    Value: !GetAtt FirehoseRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-FirehoseRoleArn

@@ -50,6 +50,8 @@ jobs:
           SNS_TOPIC_ARN: ${{ vars.SNS_TOPIC_ARN || '' }}
           SQS_QUEUE_URL: ${{ vars.SQS_QUEUE_URL || '' }}
           SQS_DLQ_URL: ${{ vars.SQS_DLQ_URL || '' }}
+          KINESIS_STREAM_VENTAS: ${{ vars.KINESIS_STREAM_VENTAS || 'stream-ventas' }}
+          KINESIS_STREAM_SECURITY_LOGS: ${{ vars.KINESIS_STREAM_SECURITY_LOGS || 'stream-security-logs' }}
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -57,7 +59,7 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           command_timeout: 60m
           # Variables reenviadas al EC2 (definidas como env de este step)
-          envs: MYSQL_ROOT_PASSWORD,SPRING_DATASOURCE_USERNAME,SPRING_DATASOURCE_PASSWORD,AZURE_AUTH_ENABLED,AZURE_CLIENT_ID,AZURE_TENANT_ID,AZURE_APP_ID_URI,AZURE_AD_ISSUER_URI,AZURE_AD_JWK_SET_URI,INTERNAL_API_TOKEN,SPRING_DATASOURCE_URL,CORS_ALLOWED_ORIGINS,AWS_REGION,SNS_TOPIC_ARN,SQS_QUEUE_URL,SQS_DLQ_URL
+          envs: MYSQL_ROOT_PASSWORD,SPRING_DATASOURCE_USERNAME,SPRING_DATASOURCE_PASSWORD,AZURE_AUTH_ENABLED,AZURE_CLIENT_ID,AZURE_TENANT_ID,AZURE_APP_ID_URI,AZURE_AD_ISSUER_URI,AZURE_AD_JWK_SET_URI,INTERNAL_API_TOKEN,SPRING_DATASOURCE_URL,CORS_ALLOWED_ORIGINS,AWS_REGION,SNS_TOPIC_ARN,SQS_QUEUE_URL,SQS_DLQ_URL,KINESIS_STREAM_VENTAS,KINESIS_STREAM_SECURITY_LOGS
           script: |
             set -euo pipefail
 
@@ -82,6 +84,7 @@ jobs:
             # Exportar para que bootstrap-ec2.sh (subproceso) las reciba
             export APP_BASE_URL CERTBOT_EMAIL CORS_ALLOWED_ORIGINS DOMAIN REPO_OWNER SPRING_DATASOURCE_URL
             export AWS_REGION SNS_TOPIC_ARN SQS_QUEUE_URL SQS_DLQ_URL
+            export KINESIS_STREAM_VENTAS KINESIS_STREAM_SECURITY_LOGS
 
             if [ -d /opt/pasalapeli/pasalapeli-database/.git ]; then
               cd /opt/pasalapeli/pasalapeli-database

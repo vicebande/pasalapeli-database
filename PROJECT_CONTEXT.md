@@ -965,3 +965,32 @@ Paleta nueva en `styles.css` (`:root`), tomada del CSS real de Passline: `--bg-m
 - El navbar desktop usa `.navbar-menu { display: contents }`: los hijos (nav + acciones) son items directos del flex del container.
 - `/admin` en desktop muestra la tabla (`.table-desktop`), en ≤900px las tarjetas (`.movie-cards`).
 - Para revisar visualmente: `npx ng build --configuration development` + mock + serve local; el **toggle "Modo Prueba"** cambia a ADMIN (el estado no sobrevive `page.goto`, hay que clickear `a[href="/admin"]` en la sesión ya abierta).
+
+## 18. ARQUITECTURA DE MÉTRICAS EN TIEMPO REAL VÍA KINESIS Y SIEM BLUE-TEAM EN AWS (21/11/2026)
+
+Se implementaron de punta a punta las capacidades de transmisión de eventos en tiempo real y seguridad blue-team del proyecto:
+
+### 18.1 Infraestructura como Código (CloudFormation) y AWS Real
+- `cloudformation/streaming-kinesis.yml`: Stack `pasalapeli-streaming-kinesis` que despliega dos Kinesis Data Streams On-Demand (`stream-ventas` y `stream-security-logs`). Desplegado exitosamente en AWS `us-east-1`.
+- `cloudformation/streaming-siem.yml`: Stack `pasalapeli-streaming-siem` que define la canalización SIEM: Dominio OpenSearch `pasalapeli-blueteam` (`t3.small.search`, rotación diaria de índices `blueteam-logs-*`), Kinesis Data Firehose `blueteam-firehose`, bucket S3 de respaldo `pasalapeli-blueteam-backup-513346712452` y rol IAM de entrega (`pasalapeli-firehose-role-513346712452`).
+- `scripts/deploy-streaming.sh`: Script ejecutable con `CAPABILITY_NAMED_IAM` para automatizar el despliegue IaC.
+
+### 18.2 Métricas de Negocio en Tiempo Real (Flujo de Ventas)
+1. **ticket-service**: Al procesar una compra pagada (`procesarCompra`), publica asíncronamente (`@Async` con pool `kinesisExecutor` + `@TransactionalEventListener(AFTER_COMMIT)`) un `EventoVenta` a `stream-ventas` mediante AWS SDK v2 (`software.amazon.awssdk:kinesis:2.25.70`). Incluye `idVenta`, `fecha` (ISO con offset de Chile), `monto`, `producto` (título de la película), `categoria` (género) e `ipCliente` (`X-Forwarded-For`/`remoteAddr`).
+2. **movie-service**: Agrega `peliculaGenero` a `DisponibilidadDTO` para propagar el género hacia `ticket-service`.
+3. **bff-service**:
+   - `RequestHeaderRelayInterceptor`: Reenvía `X-Forwarded-For` hacia los microservicios.
+   - `VentasKinesisPoller`: Poller programado cada 1 s que consume de `stream-ventas` desde `TRIM_HORIZON` con deduplicación por número de secuencia. Permite reconstruir las métricas en memoria tras reinicios de la JVM.
+   - `MetricasAggService`: Agregación en memoria (total vendido hoy, ventas por minuto para el gráfico de líneas y top de películas para el gráfico de barras horizontales, reiniciado a medianoche de `America/Santiago`).
+   - `WebSocketConfig` + `MetricasBroadcaster`: Servidor WebSocket STOMP sobre el endpoint público `/ws` que transmite cada 1.5 s el snapshot de métricas al canal `/topic/metrics`.
+   - `AdminMetricsBffController`: Sirve `GET /api/admin/metrics/snapshot` para el primer renderizado del frontend antes de la reconexión STOMP.
+4. **frontend**:
+   - Componente `admin-metrics` en el panel de administración con badge de estado ("En vivo" / "Desconectado"), stat box de monto y ventas del día, gráfico de líneas en pesos CLP por minuto y gráfico de barras del Top 5 de películas.
+   - `metrics.service.ts`: Cliente STOMP (`@stomp/stompjs`) con reconexión automática y sincronización inicial por REST.
+   - `nginx.conf`: Directiva `location ^~ /ws/` con `Upgrade` headers y timeout de 3600 s + CSP actualizada con `connect-src 'self' ws: wss: ...`.
+
+### 18.3 SIEM Blue-Team (Seguridad)
+1. **bff-service (`SecurityLogFilter` + `SecurityLogPublisher`)**: Filtro Servlet de máxima prioridad (`Ordered.HIGHEST_PRECEDENCE`) que envuelve todas las peticiones HTTP antes de la cadena de seguridad.
+2. Captura respuestas HTTP 401 (`LOGIN_FALLIDO`), 403 (`ACCESO_DENEGADO`), >= 500 (`ERROR_SERVIDOR`) y analiza la URI en busca de patrones de sondeo e inyección (`../`, `/etc/passwd`, `wp-admin`, `.env`, `<script`, `union select`, etc. -> `PETICION_SOSPECHOSA`).
+3. Extrae el usuario (cabecera demo o decodificación JWT) e IP de origen (`X-Forwarded-For`), y lo transmite asíncronamente a `stream-security-logs`.
+4. Firehose ingiere el stream y entrega los documentos formateados al índice OpenSearch `blueteam-logs-*` (con respaldo S3).
