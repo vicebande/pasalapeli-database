@@ -63,9 +63,9 @@ log "Preparando directorio de despliegue"
 sudo mkdir -p "$APP_DIR"
 sudo chown -R "$(whoami)" "$APP_DIR"
 
-log "Clonando/actualizando repositorios (database + frontend)"
+log "Clonando/actualizando repositorios (database + frontend + bff)"
 if [[ -n "$REPO_OWNER" ]]; then
-  for repo in pasalapeli-database pasalapeli-frontend; do
+  for repo in pasalapeli-database pasalapeli-frontend pasalapeli-bff-service; do
     if [[ -d "$APP_DIR/$repo/.git" ]]; then
       (cd "$APP_DIR/$repo" && git fetch --prune origin && git reset --hard origin/main)
     else
