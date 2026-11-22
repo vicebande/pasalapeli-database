@@ -42,16 +42,21 @@ jobs:
 
       - name: Terraform Format
         run: terraform fmt -check -recursive
+        working-directory: terraform
 
       - name: Terraform Init
         run: terraform init -backend=true -backend-config="bucket=pasalapeli-tfstate" -backend-config="key=pasalapeli-database/terraform.tfstate" -backend-config="region=us-east-1" -input=false
+        working-directory: terraform
 
       - name: Terraform Validate
         run: terraform validate
+        working-directory: terraform
 
       - name: Terraform Plan
         run: terraform plan -no-color
+        working-directory: terraform
 
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main'
         run: terraform apply -auto-approve
+        working-directory: terraform
