@@ -7,7 +7,7 @@ services:
     build:
       context: ../pasalapeli-frontend
       args:
-        AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-00000000-0000-0000-0000-000000000000}
+        AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-00000000-0000-0000-000000000000}
         AZURE_TENANT_ID: ${AZURE_TENANT_ID:-common}
         APP_BASE_URL: ${APP_BASE_URL:-https://peli.midominio.cl}
         EC2_APPS_HOST: ${EC2_APPS_HOST:-bff-service}
@@ -16,3 +16,33 @@ services:
       - "443:8443"
     volumes:
       - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - bff-service
+
+  bff-service:
+    container_name: pasalapeli-bff
+    restart: unless-stopped
+    build:
+      context: ../pasalapeli-bff-service
+    environment:
+      - AZURE_AUTH_ENABLED=true
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID:-00000000-0000-0000-000000000000}
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID:-common}
+      - AZURE_APP_ID_URI=${AZURE_APP_ID_URI:-api://00000000-0000-0000-000000000000}
+      - AZURE_AD_ISSUER_URI=${AZURE_AD_ISSUER_URI:-https://login.microsoftonline.com/common/v2.0/keys}
+      - AZURE_AD_JWK_SET_URI=${AZURE_AD_JWK_SET_URI:-https://login.microsoftonline.com/common/discovery/v2.0/keys}
+      - MOVIE_SERVICE_URL=http://movie-service:8082
+      - TICKET_SERVICE_URL=http://ticket-service:8083
+      - NOTIFICATION_SERVICE_URL=http://notification-service:8084
+      - CORS_ALLOWED_ORIGINS=*
+      - AWS_REGION=us-east-1
+      - KINESIS_STREAM_VENTAS=stream-ventas
+      - KINESIS_STREAM_SECURITY_LOGS=stream-security-logs
+    ports:
+      - "8080:8080"
+    networks:
+      - pasalapeli-net
+
+networks:
+  pasalapeli-net:
+    driver: bridge
